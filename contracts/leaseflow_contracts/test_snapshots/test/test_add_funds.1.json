@@ -7,6 +7,29 @@
   "auth": [
     [],
     [],
+    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "add_funds",
+              "args": [
+                {
+                  "symbol": "lease1"
+                },
+                {
+                  "i128": "500"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
     []
   ],
   "ledger": {
@@ -36,7 +59,7 @@
                   "storage": [
                     {
                       "key": {
-                        "symbol": "lease"
+                        "symbol": "lease1"
                       },
                       "val": {
                         "map": [
@@ -53,7 +76,7 @@
                               "symbol": "amount"
                             },
                             "val": {
-                              "i128": "1000"
+                              "i128": "1500"
                             }
                           },
                           {
@@ -61,7 +84,7 @@
                               "symbol": "expiry_time"
                             },
                             "val": {
-                              "u64": "86400"
+                              "u64": "43286400"
                             }
                           },
                           {
@@ -91,6 +114,26 @@
           "ext": "v0"
         },
         "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "801925984706572462"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
       },
       {
         "entry": {
