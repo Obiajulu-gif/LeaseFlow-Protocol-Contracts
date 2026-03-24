@@ -148,6 +148,32 @@ pub struct LeaseTerminated {
     pub lease_id: Symbol,
 }
 
+/// Emitted when a lease starts and the asset becomes available to the renter.
+#[contractevent]
+pub struct LeaseStarted {
+    pub id: u64,
+    pub renter: Address,
+    pub rate: i128,
+}
+
+/// Emitted when a lease ends and total payment information is available.
+#[contractevent]
+pub struct LeaseEnded {
+    pub id: u64,
+    pub duration: u64,
+    pub total_paid: i128,
+}
+
+/// Emitted when an asset is reclaimed by the landlord or system.
+#[contractevent]
+pub struct AssetReclaimed {
+    pub id: u64,
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -391,6 +417,16 @@ impl LeaseContract {
         lease.status = LeaseStatus::Active;
 
         env.storage().instance().set(&lease_id, &lease);
+        
+        // Emit LeaseStarted event for frontend notification
+        // Use the current timestamp as a simple ID for the event
+        let event_id = env.ledger().timestamp();
+        LeaseStarted {
+            id: event_id,
+            renter: tenant,
+            rate: lease.rent_per_sec,
+        }.publish(&env);
+        
         symbol_short!("active")
     }
 
@@ -784,6 +820,59 @@ impl LeaseContract {
         if env.storage().persistent().has(&key) {
             env.storage().persistent().extend_ttl(&key, MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
         }
+
+        // 6. State cleanup — delete from active storage.
+        let lease_duration = lease.end_date.saturating_sub(lease.start_date);
+        let total_payments = lease.rent_paid;
+
+        delete_lease(&env, lease_id);
+
+        // 7. Emit termination event.
+        LeaseTerminated { lease_id }.publish(&env);
+        
+        // 8. Emit LeaseEnded event for frontend notification
+        LeaseEnded {
+            id: lease_id,
+            duration: lease_duration,
+            total_paid: total_payments,
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Reclaims an asset from a lease, typically called by landlord or system.
+    /// Emits AssetReclaimed event for frontend notification.
+    pub fn reclaim_asset(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+        reason: String,
+    ) -> Result<(), LeaseError> {
+        // Load lease
+        let lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Authorisation — caller must be landlord, tenant, or admin.
+        let is_landlord = caller == lease.landlord;
+        let is_tenant = caller == lease.tenant;
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|admin| admin == caller)
+            .unwrap_or(false);
+
+        if !is_landlord && !is_tenant && !is_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        caller.require_auth();
+
+        // Emit AssetReclaimed event for frontend notification
+        AssetReclaimed {
+            id: lease_id,
+            reason: reason.clone(),
+        }.publish(&env);
+
+        Ok(())
         env.storage().instance().extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
     }
 }

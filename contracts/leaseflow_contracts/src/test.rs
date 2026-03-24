@@ -251,11 +251,102 @@ fn test_terminate_lease_emits_terminated_event() {
     client.terminate_lease(&LEASE_ID, &landlord);
 
     // Assert — the LeaseTerminated event must have been emitted.
-    let expected = LeaseTerminated { lease_id: LEASE_ID };
-    assert_eq!(
-        env.events().all(),
-        std::vec![expected.to_xdr(&env, &id)],
-    );
+    let expected_terminated = LeaseTerminated { lease_id: LEASE_ID };
+    let expected_ended = LeaseEnded {
+        id: LEASE_ID,
+        duration: END - START,
+        total_paid: 0, // From make_lease default
+    };
+    
+    let events = env.events().all();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0], expected_terminated.to_xdr(&env, &id));
+    assert_eq!(events[1], expected_ended.to_xdr(&env, &id));
+}
+
+/// Tests that LeaseStarted event is emitted when a lease is activated.
+#[test]
+fn test_activate_lease_emits_started_event() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    // Create a pending lease first
+    client.create_lease(&landlord, &tenant, &1000i128);
+
+    // Act
+    let result = client.activate_lease(&symbol_short!("lease"), &tenant);
+
+    // Assert
+    assert_eq!(result, symbol_short!("active"));
+    
+    // Check that LeaseStarted event was emitted
+    // Use the expected timestamp as ID
+    let expected_timestamp = env.ledger().timestamp();
+    let expected = LeaseStarted {
+        id: expected_timestamp,
+        renter: tenant,
+        rate: 0, // Will be 0 for simple lease
+    };
+    
+    let events = env.events().all();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], expected.to_xdr(&env, &id));
+}
+
+/// Tests that AssetReclaimed event is emitted when an asset is reclaimed.
+#[test]
+fn test_reclaim_asset_emits_reclaimed_event() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let reason = String::from_str(&env, "Lease expired - asset returned");
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+
+    // Act
+    let result = client.reclaim_asset(&LEASE_ID, &landlord, &reason);
+
+    // Assert
+    assert_eq!(result, ());
+    
+    // Check that AssetReclaimed event was emitted
+    let expected = AssetReclaimed {
+        id: LEASE_ID,
+        reason: reason.clone(),
+    };
+    
+    let events = env.events().all();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], expected.to_xdr(&env, &id));
+}
+
+/// Tests that unauthorized reclaim_asset calls return error.
+#[test]
+fn test_reclaim_asset_unauthorized() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let reason = String::from_str(&env, "Unauthorized attempt");
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+
+    // Act
+    let result = client.reclaim_asset(&LEASE_ID, &unauthorized, &reason);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
+    
+    // No events should be emitted
+    let events = env.events().all();
+    assert_eq!(events.len(), 0);
 }
 
 // ---------------------------------------------------------------------------
