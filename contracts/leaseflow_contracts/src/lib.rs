@@ -1,32 +1,22 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    Address, Env, Symbol, BytesN, String,
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address, Env,
-    String, Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, 
+    Address, Env, String, Symbol, BytesN
 };
 
 // Re-export the pure math function so contract callers and tests can use it.
-pub use leaseflow_math::calculate_total_cost;
+// pub use leaseflow_math::calculate_total_cost; // Only if available in dependencies
 
-// ---------------------------------------------------------------------------
-// Existing simple Lease struct (preserved for backwards compatibility)
-// ---------------------------------------------------------------------------
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Lease {
-    pub landlord: Address,
-    pub tenant: Address,
-    pub amount: i128,
-    pub active: bool,
+macro_rules! require {
+    ($condition:expr, $error_msg:expr) => {
+        if !$condition {
+            panic!($error_msg);
+        }
+    };
 }
 
 // ── Rate helpers ──────────────────────────────────────────────────────────────
 
-/// Describes the time unit in which a monetary rate is expressed by the caller.
-/// All rates are normalised to **per-second** before being stored on-chain, so
-/// internal arithmetic never needs to know the original unit.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
@@ -34,7 +24,6 @@ pub enum RateType {
     PerHour,
     PerDay,
 }
-
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -44,14 +33,10 @@ pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     }
 }
 
-/// Seconds of lease time granted per unit of funds added (1 day per unit).
 pub const SECS_PER_UNIT: u64 = 86_400;
 
-// ---------------------------------------------------------------------------
-// LeaseInstance — full-featured lease used by terminate_lease and related fns
-// ---------------------------------------------------------------------------
+// ── Status Enums ──────────────────────────────────────────────────────────────
 
-/// Deposit lifecycle: Held → Settled (returned or claimed) | Disputed
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DepositStatus {
@@ -77,133 +62,77 @@ pub struct UsageRights {
 pub enum LeaseStatus {
     Pending,
     Active,
+    Expired,
     Disputed,
     Terminated,
 }
 
-mod nft_contract {
-    use soroban_sdk::{contractclient, Address, Env};
+// ── Structs ───────────────────────────────────────────────────────────────────
 
-    #[allow(dead_code)]
-    #[contractclient(name = "NftClient")]
-    pub trait NftInterface {
-        fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
-    }
-}
-
-/// Seconds of lease time granted per unit of funds added (1 day per unit).
-pub const SECS_PER_UNIT: u64 = 86_400;
-
-pub mod proration;
-
-/// Core lease record stored on-chain.
-///
-/// All rate fields (`rent_per_sec`, `late_fee_per_sec`) are normalised to
-/// **per-second** by [`to_per_second`] at creation time — callers pass the
-/// human-friendly value together with a [`RateType`] and conversion happens
-/// once in the contract entry points.
-/// Full lease record stored on-ledger.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseInstance {
     pub landlord: Address,
     pub tenant: Address,
-    /// Per-second rent rate (normalised from the caller-supplied `RateType`).
-    pub rent_per_sec: i128,
-    /// Monthly / periodic rent amount in stroops.
     pub rent_amount: i128,
-    /// Security deposit amount in stroops.
     pub deposit_amount: i128,
-    /// Unix timestamp: lease start.
     pub start_date: u64,
-    /// Unix timestamp: lease end — termination is only allowed after this.
     pub end_date: u64,
-    /// Unix timestamp up to which rent has been paid. Must be >= end_date to terminate.
-    pub rent_paid_through: u64,
-    /// Deposit lifecycle state. Must be Settled before termination.
-    pub deposit_status: DepositStatus,
-    /// Lease lifecycle state.
+    pub property_uri: String,
     pub status: LeaseStatus,
     pub nft_contract: Option<Address>,
     pub token_id: Option<u128>,
     pub active: bool,
-    pub grace_period_end: u64,
-    /// One-time flat late fee applied the first second rent is overdue.
-    pub late_fee_flat: i128,
-    /// Per-second late fee (normalised from the caller-supplied `RateType`).
-    pub late_fee_per_sec: i128,
-    pub debt: i128,
-    pub flat_fee_applied: bool,
-    /// Total seconds of lateness for which the per-second fee has been charged.
-    pub seconds_late_charged: u64,
     pub rent_paid: i128,
-    pub expiry_time: u64,
-    /// IPFS / HTTP URI pointing to the off-chain lease document.
-    pub property_uri: String,
+    pub debt: i128,
 }
 
-/// Archived record written to persistent storage on successful termination.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Receipt {
+    pub lease_id: Symbol,
+    pub month: u32,
+    pub amount: i128,
+    pub date: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseAmendment {
-    /// Provide a new per-second rent rate, already normalised via
-    /// [`to_per_second`] off-chain (or pass `None` to keep current value).
-    pub new_rent_per_sec: Option<i128>,
+    pub new_rent_amount: Option<i128>,
     pub new_end_date: Option<u64>,
     pub landlord_signature: BytesN<32>,
     pub tenant_signature: BytesN<32>,
-pub struct HistoricalLease {
-    pub lease: LeaseInstance,
-    /// Ledger timestamp at the moment of termination.
-    pub terminated_at: u64,
-    /// Address that invoked terminate_lease.
-    pub terminated_by: Address,
 }
-
-/// Parameters for creating a new LeaseInstance. Grouped to keep entry-point arg count ≤ 7.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateLeaseParams {
-    pub tenant: Address,
-    pub rent_amount: i128,
-    pub deposit_amount: i128,
-    pub start_date: u64,
-    pub end_date: u64,
-    pub property_uri: String,
-}
-
-// ---------------------------------------------------------------------------
-// Events
-// ---------------------------------------------------------------------------
-
-/// Emitted when a lease is successfully terminated and removed from storage.
-#[contractevent]
-pub struct LeaseTerminated {
-    pub lease_id: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Storage keys
-// ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositReleasePartial {
+    pub tenant_amount: i128,
+    pub landlord_amount: i128,
+}
+
+#[contracttype]
 pub enum DepositRelease {
     FullRefund,
     PartialRefund(DepositReleasePartial),
     Disputed,
 }
 
-// ── Contract ──────────────────────────────────────────────────────────────────
-#[derive(Clone)]
+// ── Events ────────────────────────────────────────────────────────────────────
+
+#[contractevent]
+pub struct LeaseTerminated {
+    pub lease_id: Symbol,
+}
+
+// ── Storage Keys ──────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    /// Simple legacy lease (symbol_short key kept for snapshot compatibility).
-    SimpleLease,
-    /// Active LeaseInstance keyed by numeric ID.
-    Lease(u64),
-    /// Historical record written after successful termination.
-    HistoricalLease(u64),
-    /// Protocol admin address.
+    Lease(Symbol),
+    Receipt(Symbol, u32),
     Admin,
     /// Usage rights for NFT renters.
     UsageRights(Address, u128),
@@ -234,10 +163,11 @@ pub enum LeaseError {
     UsageRightsNotFound = 8,
     UsageRightsExpired = 9,
 }
+// ── Storage Helpers ───────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Storage helpers
-// ---------------------------------------------------------------------------
+const DAY_IN_LEDGERS: u32 = 17280; // Assuming 5s ledger time
+const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
+const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
 
 /// Fetch UsageRights from storage, or None.
 pub fn load_usage_rights(env: &Env, nft_contract: Address, token_id: u128) -> Option<UsageRights> {
@@ -259,124 +189,60 @@ pub fn delete_usage_rights(env: &Env, nft_contract: Address, token_id: u128) {
 /// Fetch a LeaseInstance from instance storage, or None.
 pub fn load_lease(env: &Env, lease_id: u64) -> Option<LeaseInstance> {
     env.storage().instance().get(&DataKey::Lease(lease_id))
+pub fn load_lease(env: &Env, lease_id: &Symbol) -> Option<LeaseInstance> {
+    env.storage().persistent().get(&DataKey::Lease(lease_id.clone()))
 }
 
-/// Persist a LeaseInstance to instance storage.
-pub fn save_lease(env: &Env, lease_id: u64, lease: &LeaseInstance) {
-    env.storage()
-        .instance()
-        .set(&DataKey::Lease(lease_id), lease);
+pub fn save_lease(env: &Env, lease_id: &Symbol, lease: &LeaseInstance) {
+    let key = DataKey::Lease(lease_id.clone());
+    env.storage().persistent().set(&key, lease);
+    // identities stored in Persistent storage to survive ledger expirations
+    env.storage().persistent().extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
 }
 
-/// Removes a LeaseInstance from active instance storage permanently.
-///
-/// Strategy: DELETE (preferred) — entry is fully removed, minimising ledger fees.
-/// TODO: consider archival strategy if an on-chain audit trail is required.
-pub fn delete_lease(env: &Env, lease_id: u64) {
-    env.storage().instance().remove(&DataKey::Lease(lease_id));
+mod nft_contract {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "NftClient")]
+    pub trait NftInterface {
+        fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
+    }
 }
 
-/// Moves a LeaseInstance to the HistoricalLeases persistent map with a terminated_at timestamp.
-/// Use this instead of delete_lease when an on-chain audit trail is required.
-pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, terminated_by: Address) {
-    let record = HistoricalLease {
-        terminated_at: env.ledger().timestamp(),
-        terminated_by,
-        lease,
-    };
-    env.storage()
-        .persistent()
-        .set(&DataKey::HistoricalLease(lease_id), &record);
-    // Remove from active storage after archiving.
-    env.storage().instance().remove(&DataKey::Lease(lease_id));
-}
-
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
+// ── Contract Implementation ───────────────────────────────────────────────────
 
 #[contract]
 pub struct LeaseContract;
 
 #[contractimpl]
 impl LeaseContract {
-    /// Calculates the prorated first month's rent based on the move-in timestamp.
-    pub fn calculate_first_month_rent(_env: Env, start_date: u64, rent_amount: i128) -> i128 {
-        proration::calculate_first_month_rent(start_date, rent_amount)
-    }
-
-    /// Initializes a lease with collateral lock (security deposit)
+    /// Initializes a lease in Persistent storage.
     pub fn initialize_lease(
-        env: Env,
-        landlord: Address,
-        tenant: Address,
-        rent_amount: i128,
-        deposit_amount: i128,
-        start_date: u64,
-        end_date: u64,
-        property_uri: String,
-    ) -> Symbol {
-        let lease = Lease {
-            landlord: landlord.clone(),
-            tenant: tenant.clone(),
-            rent_amount,
-            deposit_amount,
-            start_date,
-            end_date,
-            property_uri: property_uri.clone(),
-            status: LeaseStatus::Pending,
-    /// Initializes a simple lease between a landlord and a tenant.
-    pub fn create_lease(
-        env: Env,
-        landlord: Address,
-        tenant: Address,
-        amount: i128,
-        grace_period_end: u64,
-        late_fee_flat: i128,
-        late_fee_per_day: i128,
-    ) -> Symbol {
-    /// Original function — unchanged behaviour, no NFT required.
-    pub fn create_lease(env: Env, landlord: Address, tenant: Address, amount: i128) -> Symbol {
-    /// Initializes a lease between a landlord and a tenant.
-    /// `lease_id` uniquely identifies the lease in storage.
-    /// `duration` sets the initial lease duration in seconds.
-    
-    pub fn create_lease(
         env: Env,
         lease_id: Symbol,
         landlord: Address,
         tenant: Address,
         rent_amount: i128,
-        rent_rate_type: RateType,
+        deposit_amount: i128,
         duration: u64,
-        grace_period_end: u64,
-        late_fee_flat: i128,
-        late_fee_amount: i128,
-        late_fee_rate_type: RateType,
-    ) -> Symbol {
-        let now = env.ledger().timestamp();
-        let expiry_time = now.saturating_add(duration);
+        property_uri: String,
+    ) -> bool {
+        landlord.require_auth();
 
-        let lease = Lease {
+        let start_date = env.ledger().timestamp();
+        let end_date = start_date.saturating_add(duration);
+
+        let lease = LeaseInstance {
             landlord,
             tenant,
-            //  normalise to per-second 
-            rent_per_sec:      to_per_second(rent_amount,     rent_rate_type),
-            late_fee_per_sec:  to_per_second(late_fee_amount, late_fee_rate_type),
-            //
-            deposit_amount: 0,
-            start_date: now,
-            end_date: expiry_time,
-            property_uri: String::from_str(&env, ""),
+            rent_amount,
+            deposit_amount,
+            start_date,
+            end_date,
+            property_uri,
             status: LeaseStatus::Pending,
             nft_contract: None,
             token_id: None,
             active: true,
-            grace_period_end,
-            late_fee_flat,
-            debt: 0,
-            flat_fee_applied: false,
-            seconds_late_charged: 0,
             rent_paid: 0,
             expiry_time,
         };
@@ -433,10 +299,6 @@ impl LeaseContract {
             grace_period_end,
             late_fee_flat,
             debt: 0,
-            flat_fee_applied: false,
-            seconds_late_charged: 0,
-            rent_paid: 0,
-            expiry_time,
         };
 
         // Grant usage rights to the tenant for the lease duration
@@ -624,177 +486,59 @@ impl LeaseContract {
                 lease.seconds_late_charged = seconds_late;
             }
         }
-
-        // ── Apply payment: clear debt first, then current-month rent ──────
-        let mut remaining = payment_amount;
-
-        if lease.debt > 0 {
-            if remaining >= lease.debt {
-                remaining -= lease.debt;
-                lease.debt = 0;
-            } else {
-                lease.debt -= remaining;
-                remaining = 0;
-            }
-    // -----------------------------------------------------------------------
-    // Legacy simple-lease entry points (preserved)
-    // -----------------------------------------------------------------------
-
-    /// Initializes a simple lease between a landlord and a tenant.
-    pub fn create_lease(env: Env, landlord: Address, tenant: Address, amount: i128) -> Symbol {
-        let lease = Lease {
-            landlord,
-            tenant,
-            amount,
-            active: true,
-        };
-        env.storage()
-            .instance()
-            .set(&symbol_short!("lease"), &lease);
-        symbol_short!("created")
+        save_lease(&env, &lease_id, &lease);
+        true
     }
 
-    /// Returns the current simple lease details stored in the contract.
-    pub fn get_lease(env: Env) -> Lease {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("lease"))
-            .expect("Lease not found")
-    }
-
-    // -----------------------------------------------------------------------
-    // LeaseInstance entry points
-    // -----------------------------------------------------------------------
-
-    /// Creates a full LeaseInstance keyed by lease_id.
-    pub fn create_lease_instance(
-        env: Env,
-        lease_id: u64,
-        landlord: Address,
-        params: CreateLeaseParams,
-    ) -> Result<(), LeaseError> {
-        landlord.require_auth();
-        let lease = LeaseInstance {
-            landlord,
-            tenant: params.tenant,
-            rent_amount: params.rent_amount,
-            deposit_amount: params.deposit_amount,
-            start_date: params.start_date,
-            end_date: params.end_date,
-            rent_paid_through: 0,
-            deposit_status: DepositStatus::Held,
-            status: LeaseStatus::Pending,
-            property_uri: params.property_uri,
-        };
-        save_lease(&env, lease_id, &lease);
-        Ok(())
-    }
-
-    /// Returns a LeaseInstance by ID.
-    pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
-        load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
-    }
-
-    /// Terminates an expired lease and clears or archives its state from ledger storage.
-    ///
-    /// # Arguments
-    /// * `env`      - The Soroban environment
-    /// * `lease_id` - Unique identifier of the lease to terminate
-    /// * `caller`   - Address of the party invoking termination (landlord, tenant, or admin)
-    ///
-    /// # Errors
-    /// * `LeaseError::LeaseNotFound`    - No lease exists for the given ID
-    /// * `LeaseError::LeaseNotExpired`  - Current ledger timestamp is before `end_date`
-    /// * `LeaseError::RentOutstanding`  - One or more rent payments remain unpaid
-    /// * `LeaseError::DepositNotSettled`- Security deposit has not been returned or claimed
-    /// * `LeaseError::Unauthorised`     - Caller is not landlord, tenant, or admin
-    ///
-    /// # Security
-    /// Caller must be the landlord, tenant, or an authorised protocol admin.
-    /// Termination is idempotent: a second call on the same ID returns LeaseNotFound.
-    /// Partial rent payment is never acceptable.
-    /// The deposit must be fully Settled before termination is allowed.
-    ///
-    /// # Storage strategy
-    /// DELETE — entry is fully removed from instance storage for maximum fee savings.
-    /// TODO: consider archival strategy (archive_lease helper) if audit trail is required.
-    pub fn terminate_lease(
-        env: Env,
-        lease_id: u64,
-        caller: Address,
-    ) -> Result<(), LeaseError> {
-        // 1. Load lease — return LeaseNotFound if missing.
-        let lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-
-        // 2. Authorisation — caller must be landlord, tenant, or admin.
-        let is_landlord = caller == lease.landlord;
-        let is_tenant = caller == lease.tenant;
-        let is_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|admin| admin == caller)
-            .unwrap_or(false);
-
-        if !is_landlord && !is_tenant && !is_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        caller.require_auth();
-
-        if remaining > 0 {
-            lease.rent_paid += remaining;
-
-            // Monthly rent = per-second rate × seconds-in-30-days.
-            let monthly_rent = lease.rent_per_sec.saturating_mul(2_592_000);
-            if lease.rent_paid >= monthly_rent {
-                lease.rent_paid -= monthly_rent;
-                lease.grace_period_end = lease.grace_period_end.saturating_add(2_592_000);
-                lease.flat_fee_applied = false;
-                lease.seconds_late_charged = 0;
-            }
-        }
-
-        env.storage().instance().set(&lease_id, &lease);
-        symbol_short!("paid")
-    }
-
-    /// Adds funds to an existing lease, extending `expiry_time` proportionally.
-    /// Each unit of `amount` extends the lease by [`SECS_PER_UNIT`] seconds.
-    /// Requires authorisation from the tenant.
-    pub fn add_funds(env: Env, lease_id: Symbol, amount: i128) -> Symbol {
-        assert!(amount > 0, "amount must be positive");
-
-        let mut lease = Self::get_lease(env.clone(), lease_id.clone());
+    /// Processes rent payment, saves receipt in Instance storage, and extends TTL.
+    pub fn pay_rent(env: Env, lease_id: Symbol, month: u32, amount: i128) -> bool {
+        let mut lease = load_lease(&env, &lease_id).expect("Lease not found");
         lease.tenant.require_auth();
 
-        let extra_secs = (amount as u64).saturating_mul(SECS_PER_UNIT);
-        lease.expiry_time = lease.expiry_time.saturating_add(extra_secs);
+        // Monthly payment receipts use Instance storage to keep costs low
+        let receipt = Receipt {
+            lease_id: lease_id.clone(),
+            month,
+            amount,
+            date: env.ledger().timestamp(),
+        };
+        
+        env.storage().instance().set(&DataKey::Receipt(lease_id.clone(), month), &receipt);
 
-        env.storage().instance().set(&lease_id, &lease);
-        symbol_short!("extended")
-        // 3. Expiry check — current time must be strictly after end_date.
-        let now = env.ledger().timestamp();
-        if now <= lease.end_date {
-            return Err(LeaseError::LeaseNotExpired);
+        lease.rent_paid += amount;
+        save_lease(&env, &lease_id, &lease);
+
+        // Keep the contract "alive" for the duration of the lease
+        env.storage().instance().extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        true
+    }
+
+    pub fn get_lease(env: Env, lease_id: Symbol) -> LeaseInstance {
+        load_lease(&env, &lease_id).expect("Lease not found")
+    }
+
+    pub fn get_receipt(env: Env, lease_id: Symbol, month: u32) -> Receipt {
+        env.storage()
+            .instance()
+            .get(&DataKey::Receipt(lease_id, month))
+            .expect("Receipt not found")
+    }
+
+    pub fn activate_lease(env: Env, lease_id: Symbol, tenant: Address) -> bool {
+        let mut lease = load_lease(&env, &lease_id).expect("Lease not found");
+        require!(lease.tenant == tenant, "Unauthorized");
+        lease.status = LeaseStatus::Active;
+        save_lease(&env, &lease_id, &lease);
+        true
+    }
+
+    pub fn extend_ttl(env: Env, lease_id: Symbol) {
+        let key = DataKey::Lease(lease_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
         }
-
-        // 4. Rent check — rent must be paid through at least end_date.
-        if lease.rent_paid_through < lease.end_date {
-            return Err(LeaseError::RentOutstanding);
-        }
-
-        // 5. Deposit check — deposit must be fully settled.
-        if lease.deposit_status != DepositStatus::Settled {
-            return Err(LeaseError::DepositNotSettled);
-        }
-
-        // 6. State cleanup — delete from active storage.
-        delete_lease(&env, lease_id);
-
-        // 7. Emit termination event.
-        LeaseTerminated { lease_id }.publish(&env);
-
-        Ok(())
+        env.storage().instance().extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
     }
 }
 

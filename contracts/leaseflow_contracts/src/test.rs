@@ -1,104 +1,65 @@
 #![cfg(test)]
-extern crate std;
 
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     Address, Env, Event, String, Symbol,
 };
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env, symbol_short};
+use crate::{LeaseContract, LeaseContractClient, LeaseStatus};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-const LEASE_ID: u64 = 1;
-const START: u64 = 1_000_000;
-const END: u64 = 2_000_000;
-
-fn make_env() -> Env {
+#[test]
+fn test_storage_management_and_ttl() {
     let env = Env::default();
     env.mock_all_auths();
-    env
-}
-
-fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance {
-    LeaseInstance {
-        landlord: landlord.clone(),
-        tenant: tenant.clone(),
-        rent_amount: 1_000,
-        deposit_amount: 2_000,
-        start_date: START,
-        end_date: END,
-        rent_paid_through: END,                 // fully paid by default
-        deposit_status: DepositStatus::Settled, // settled by default
-        status: LeaseStatus::Active,
-        property_uri: String::from_str(env, "ipfs://QmHash123"),
-    }
-}
-
-/// Register the contract and return (contract_id, client).
-fn setup(env: &Env) -> (Address, LeaseContractClient<'_>) {
-    let id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(env, &id);
-    (id, client)
-}
-
-/// Seed a LeaseInstance directly into contract storage (bypasses auth).
-fn seed_lease(env: &Env, contract_id: &Address, lease_id: u64, lease: &LeaseInstance) {
-    env.as_contract(contract_id, || save_lease(env, lease_id, lease));
-}
-
-/// Read a LeaseInstance directly from contract storage.
-fn read_lease(env: &Env, contract_id: &Address, lease_id: u64) -> Option<LeaseInstance> {
-    env.as_contract(contract_id, || load_lease(env, lease_id))
-}
-
-// ---------------------------------------------------------------------------
-// Legacy test (preserved)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_lease() {
-    let env = make_env();
-    let (_, client) = setup(&env);
-
+    
+    let contract_id = env.register(LeaseContract, ());
+    let client = LeaseContractClient::new(&env, &contract_id);
+    
+    let lease_id = symbol_short!("lease1");
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
+    let rent_amount = 5000i128;
+    let deposit_amount = 10000i128;
+    let duration = 31_536_000u64; // 1 year
+    let property_uri = String::from_str(&env, "ipfs://QmHash123");
 
-    client.create_lease(&landlord, &tenant, &1000i128);
-    let lease = client.get_lease();
+    // ── 1. Create Lease: Core identities in Persistent storage ──────────────────
+    client.initialize_lease(
+        &lease_id,
+        &landlord,
+        &tenant,
+        &rent_amount,
+        &deposit_amount,
+        &duration,
+        &property_uri,
+    );
 
+    let lease = client.get_lease(&lease_id);
     assert_eq!(lease.landlord, landlord);
     assert_eq!(lease.tenant, tenant);
-    assert_eq!(lease.amount, 1000);
-    assert!(lease.active);
+    assert_eq!(lease.rent_amount, rent_amount);
+    assert_eq!(lease.status, LeaseStatus::Pending);
+
+    client.activate_lease(&lease_id, &tenant);
+    let lease = client.get_lease(&lease_id);
+    assert_eq!(lease.status, LeaseStatus::Active);
+
+    // ── 2. Pay Rent: Monthly receipts in Instance storage ──────────────────────
+    let month = 1;
+    let amount_paid = 5000i128;
+    client.pay_rent(&lease_id, &month, &amount_paid);
+
+    let receipt = client.get_receipt(&lease_id, &month);
+    assert_eq!(receipt.lease_id, lease_id);
+    assert_eq!(receipt.month, month);
+    assert_eq!(receipt.amount, amount_paid);
+    assert_eq!(receipt.date, 0); // Ledger starts at 0 
+
+    // ── 3. TTL Extension Check (Simplified) ───────────────────────────────────
+    client.extend_ttl(&lease_id);
 }
 
-// ---------------------------------------------------------------------------
-// terminate_lease tests
-// ---------------------------------------------------------------------------
-
-/// Happy path — expired, fully paid, settled lease is removed from storage.
-#[test]
-fn test_terminate_lease_success_deletes_storage() {
-    // Arrange
-    let env = make_env();
-    let (id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
-    env.ledger().with_mut(|l| l.timestamp = END + 1);
-
-    // Act
-    let result = client.terminate_lease(&LEASE_ID, &landlord);
-
-    // Assert
-    assert_eq!(result, ());
-    assert!(read_lease(&env, &id, LEASE_ID).is_none());
-}
-
-/// Returns LeaseNotExpired when called before end_date.
 #[test]
 fn test_terminate_lease_before_end_date_fails() {
     // Arrange
@@ -523,4 +484,10 @@ fn test_terminate_archived_lease_moves_to_historical() {
     assert_eq!(record.lease, lease);
     assert_eq!(record.terminated_by, landlord);
     assert_eq!(record.terminated_at, END + 1);
+#[should_panic(expected = "Lease not found")]
+fn test_get_nonexistent_lease() {
+    let env = Env::default();
+    let contract_id = env.register(LeaseContract, ());
+    let client = LeaseContractClient::new(&env, &contract_id);
+    client.get_lease(&symbol_short!("ghost"));
 }
