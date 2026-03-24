@@ -33,6 +33,20 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         deposit_status: DepositStatus::Settled, // settled by default
         status: LeaseStatus::Active,
         property_uri: String::from_str(env, "ipfs://QmHash123"),
+        rent_per_sec: 0,
+        nft_contract: None,
+        token_id: None,
+        active: true,
+        grace_period_end: 0,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        debt: 0,
+        flat_fee_applied: false,
+        seconds_late_charged: 0,
+        rent_paid: 0,
+        expiry_time: 0,
+        buyout_price: None,
+        cumulative_payments: 0,
     }
 }
 
@@ -311,4 +325,165 @@ fn test_terminate_archived_lease_moves_to_historical() {
     assert_eq!(record.lease, lease);
     assert_eq!(record.terminated_by, landlord);
     assert_eq!(record.terminated_at, END + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Buyout functionality tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_set_buyout_price_simple_lease() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    client.create_lease(&landlord, &tenant, &1000i128);
+    
+    // Set buyout price
+    client.set_buyout_price(&symbol_short!("lease"), &landlord, &5000i128);
+    
+    let lease = client.get_lease();
+    assert_eq!(lease.buyout_price, Some(5000i128));
+    assert_eq!(lease.cumulative_payments, 0);
+}
+
+#[test]
+fn test_set_buyout_price_unauthorized() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+
+    client.create_lease(&landlord, &tenant, &1000i128);
+    
+    // Try to set buyout price as unauthorized user
+    env.mock_all_auths();
+    env.set_contract_auths(&[(&unauthorized, &symbol_short!("set_buyout_price"))]);
+    
+    let result = std::panic::catch_unwind(|| {
+        client.set_buyout_price(&symbol_short!("lease"), &unauthorized, &5000i128);
+    });
+    
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_buyout_with_simple_lease() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    client.create_lease(&landlord, &tenant, &1000i128);
+    client.set_buyout_price(&symbol_short!("lease"), &landlord, &3000i128);
+    
+    // Make payments that reach the buyout price
+    client.pay_rent(&symbol_short!("lease"), &1000i128);
+    client.pay_rent(&symbol_short!("lease"), &1000i128);
+    client.pay_rent(&symbol_short!("lease"), &1000i128);
+    
+    let lease = client.get_lease();
+    assert_eq!(lease.cumulative_payments, 3000i128);
+    assert!(!lease.active); // Should be inactive after buyout
+}
+
+#[test]
+fn test_set_lease_instance_buyout_price() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    
+    // Set buyout price
+    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &5000i128).unwrap();
+    
+    let lease = client.get_lease_instance(&LEASE_ID).unwrap();
+    assert_eq!(lease.buyout_price, Some(5000i128));
+    assert_eq!(lease.cumulative_payments, 0);
+}
+
+#[test]
+fn test_lease_instance_buyout_execution() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &3000i128).unwrap();
+    
+    // Make payments that reach the buyout price
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
+    
+    // Lease should be terminated and archived
+    assert!(read_lease(&env, &id, LEASE_ID).is_none());
+    
+    // Check historical record
+    let record: HistoricalLease = env.as_contract(&id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HistoricalLease(LEASE_ID))
+            .expect("HistoricalLease not found")
+    });
+    
+    assert_eq!(record.lease.cumulative_payments, 3000i128);
+    assert_eq!(record.lease.status, LeaseStatus::Terminated);
+    assert!(!record.lease.active);
+}
+
+#[test]
+fn test_buyout_price_not_reached() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    client.set_lease_instance_buyout_price(&LEASE_ID, &landlord, &5000i128).unwrap();
+    
+    // Make payments that don't reach the buyout price
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
+    client.pay_lease_instance_rent(&LEASE_ID, &1000i128).unwrap();
+    
+    // Lease should still be active
+    let lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(lease.cumulative_payments, 2000i128);
+    assert!(lease.active);
+    assert_eq!(lease.status, LeaseStatus::Active);
 }

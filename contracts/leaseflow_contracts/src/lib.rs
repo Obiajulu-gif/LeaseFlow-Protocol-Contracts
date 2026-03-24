@@ -20,6 +20,10 @@ pub struct Lease {
     pub tenant: Address,
     pub amount: i128,
     pub active: bool,
+    /// Optional price at which the tenant can buy out the asset.
+    pub buyout_price: Option<i128>,
+    /// Total cumulative payments made by the tenant.
+    pub cumulative_payments: i128,
 }
 
 // ── Rate helpers ──────────────────────────────────────────────────────────────
@@ -129,6 +133,10 @@ pub struct LeaseInstance {
     pub expiry_time: u64,
     /// IPFS / HTTP URI pointing to the off-chain lease document.
     pub property_uri: String,
+    /// Optional price at which the tenant can buy out the asset.
+    pub buyout_price: Option<i128>,
+    /// Total cumulative payments made by the tenant.
+    pub cumulative_payments: i128,
 }
 
 /// Archived record written to persistent storage on successful termination.
@@ -345,6 +353,8 @@ impl LeaseContract {
             seconds_late_charged: 0,
             rent_paid: 0,
             expiry_time,
+            buyout_price: None,
+            cumulative_payments: 0,
         };
 
         env.storage().instance().set(&lease_id, &lease);
@@ -402,6 +412,8 @@ impl LeaseContract {
             seconds_late_charged: 0,
             rent_paid: 0,
             expiry_time,
+            buyout_price: None,
+            cumulative_payments: 0,
         };
 
         env.storage().instance().set(&lease_id, &lease);
@@ -552,11 +564,29 @@ impl LeaseContract {
             tenant,
             amount,
             active: true,
+            buyout_price: None,
+            cumulative_payments: 0,
         };
         env.storage()
             .instance()
             .set(&symbol_short!("lease"), &lease);
         symbol_short!("created")
+    }
+
+    /// Sets the buyout price for a lease. Can only be called by the landlord.
+    pub fn set_buyout_price(env: Env, lease_id: Symbol, landlord: Address, buyout_price: i128) -> Symbol {
+        let mut lease = Self::get_lease(env.clone(), lease_id.clone());
+        
+        require!(
+            lease.landlord == landlord,
+            "Unauthorized: Only landlord can set buyout price"
+        );
+        require!(buyout_price > 0, "Buyout price must be positive");
+        
+        lease.buyout_price = Some(buyout_price);
+        
+        env.storage().instance().set(&lease_id, &lease);
+        symbol_short!("buyout_set")
     }
 
     /// Returns the current simple lease details stored in the contract.
@@ -590,6 +620,20 @@ impl LeaseContract {
             deposit_status: DepositStatus::Held,
             status: LeaseStatus::Pending,
             property_uri: params.property_uri,
+            rent_per_sec: 0,
+            nft_contract: None,
+            token_id: None,
+            active: true,
+            grace_period_end: 0,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            debt: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            rent_paid: 0,
+            expiry_time: 0,
+            buyout_price: None,
+            cumulative_payments: 0,
         };
         save_lease(&env, lease_id, &lease);
         Ok(())
@@ -598,6 +642,70 @@ impl LeaseContract {
     /// Returns a LeaseInstance by ID.
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
         load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
+    }
+
+    /// Sets the buyout price for a LeaseInstance. Can only be called by the landlord.
+    pub fn set_lease_instance_buyout_price(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        buyout_price: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        if buyout_price <= 0 {
+            panic!("Buyout price must be positive");
+        }
+        
+        lease.buyout_price = Some(buyout_price);
+        save_lease(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Processes a rent payment for LeaseInstance and checks for buyout condition.
+    pub fn pay_lease_instance_rent(
+        env: Env,
+        lease_id: u64,
+        payment_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !lease.active {
+            return Err(LeaseError::LeaseNotFound);
+        }
+        
+        // Track cumulative payments
+        lease.cumulative_payments += payment_amount;
+        
+        // Check for buyout condition
+        if let Some(buyout_price) = lease.buyout_price {
+            if lease.cumulative_payments >= buyout_price {
+                // Transfer ownership to tenant
+                lease.active = false;
+                lease.status = LeaseStatus::Terminated;
+                
+                // If there's an NFT, transfer it to the tenant
+                if let (Some(nft_contract), Some(token_id)) = (&lease.nft_contract, &lease.token_id) {
+                    let nft_client = nft_contract::NftClient::new(&env, nft_contract);
+                    nft_client.transfer_from(
+                        &env.current_contract_address(),
+                        &lease.landlord,
+                        &lease.tenant,
+                        token_id,
+                    );
+                }
+                
+                // Archive the lease after buyout
+                archive_lease(&env, lease_id, lease, env.current_contract_address());
+                return Ok(());
+            }
+        }
+        
+        save_lease(&env, lease_id, &lease);
+        Ok(())
     }
 
     /// Terminates an expired lease and clears or archives its state from ledger storage.
@@ -648,6 +756,7 @@ impl LeaseContract {
 
         if remaining > 0 {
             lease.rent_paid += remaining;
+            lease.cumulative_payments += payment_amount;
 
             // Monthly rent = per-second rate × seconds-in-30-days.
             let monthly_rent = lease.rent_per_sec.saturating_mul(2_592_000);
@@ -660,6 +769,27 @@ impl LeaseContract {
         }
 
         env.storage().instance().set(&lease_id, &lease);
+        
+        // Check for buyout condition
+        if let Some(buyout_price) = lease.buyout_price {
+            if lease.cumulative_payments >= buyout_price {
+                // Transfer ownership to tenant
+                lease.active = false;
+                lease.status = LeaseStatus::Terminated;
+                
+                // If there's an NFT, transfer it to the tenant
+                if let (Some(nft_contract), Some(token_id)) = (&lease.nft_contract, &lease.token_id) {
+                    let nft_client = nft_contract::NftClient::new(&env, nft_contract);
+                    nft_client.transfer_from(
+                        &env.current_contract_address(),
+                        &lease.landlord,
+                        &lease.tenant,
+                        token_id,
+                    );
+                }
+            }
+        }
+        
         symbol_short!("paid")
     }
 
