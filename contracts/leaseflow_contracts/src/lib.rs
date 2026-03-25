@@ -213,7 +213,20 @@ pub struct MaintenanceVerified {
     pub withheld_released: i128,
 }
 
+#[contractevent]
+pub struct DepositDisputed {
+    pub lease_id: u64,
+    pub caller: Address,
+}
+
+#[contractevent]
+pub struct DisputeResolved {
+    pub lease_id: u64,
+    pub resolution: DepositReleasePartial,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
+
 
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +564,49 @@ impl LeaseContract {
         MaintenanceVerified { lease_id, inspector, withheld_released: released }.publish(&env);
         Ok(())
     }
+
+    pub fn set_admin(env: Env, admin: Address) -> Result<(), LeaseError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(LeaseError::Unauthorised); // Only set once if no admin exists
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
+    }
+
+    pub fn dispute_deposit(env: Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if caller != lease.landlord && caller != lease.tenant { return Err(LeaseError::Unauthorised); }
+        caller.require_auth();
+        
+        lease.deposit_status = DepositStatus::Disputed;
+        lease.status = LeaseStatus::Disputed;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        DepositDisputed { lease_id, caller }.publish(&env);
+        Ok(())
+    }
+
+    pub fn resolve_dispute(env: Env, lease_id: u64, landlord_bps: u32) -> Result<DepositReleasePartial, LeaseError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(LeaseError::Unauthorised)?;
+        admin.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.deposit_status != DepositStatus::Disputed { return Err(LeaseError::DepositNotSettled); }
+
+        let total = lease.deposit_amount;
+        let (landlord_share, tenant_share) = leaseflow_math::calculate_deposit_split(total, landlord_bps)
+            .ok_or(LeaseError::InvalidDeduction)?;
+
+        lease.deposit_status = DepositStatus::Settled;
+        lease.status = LeaseStatus::Terminated;
+        save_lease_instance(&env, lease_id, &lease);
+
+        let resolution = DepositReleasePartial { tenant_amount: tenant_share, landlord_amount: landlord_share };
+        DisputeResolved { lease_id, resolution: resolution.clone() }.publish(&env);
+        
+        Ok(resolution)
+    }
 }
 
 mod test;
+

@@ -17,3 +17,10 @@ name = "fuzz_rent_duration"
 path = "fuzz_targets/fuzz_rent_duration.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_deposit_split"
+path = "fuzz_targets/fuzz_deposit_split.rs"
+test = false
+doc = false
+
