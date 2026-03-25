@@ -119,6 +119,8 @@ pub struct LeaseInstance {
     pub withdrawal_address: Option<Address>,
     /// Total rent withdrawn by the landlord.
     pub rent_withdrawn: i128,
+    /// Whitelisted arbitrators agreed upon by both parties.
+    pub arbitrators: soroban_sdk::Vec<Address>,
 }
 
 #[contracttype]
@@ -232,6 +234,7 @@ pub enum LeaseError {
     UsageRightsNotFound = 9,
     UsageRightsExpired = 10,
     WithdrawalAddressNotSet = 11,
+    NotAnArbitrator = 12,
 }
 // ── Storage Helpers ───────────────────────────────────────────────────────────
 
@@ -637,6 +640,8 @@ impl LeaseContract {
         params: CreateLeaseParams,
     ) -> Result<(), LeaseError> {
         landlord.require_auth();
+        // Require tenant agreement to the terms, including the arbitrator whitelist
+        params.tenant.require_auth();
         let lease = LeaseInstance {
             landlord,
             tenant: params.tenant,
@@ -665,6 +670,7 @@ impl LeaseContract {
             seconds_late_charged: 0,
             withdrawal_address: None,
             rent_withdrawn: 0,
+            arbitrators: params.arbitrators,
         };
         save_lease(&env, lease_id, &lease);
         Ok(())
@@ -1077,6 +1083,39 @@ impl LeaseContract {
         save_lease(&env, lease_id, &lease);
         
         // 8. Return refund amount
+        Ok(refund_amount)
+    }
+
+    /// Resolves a dispute by allowing a whitelisted arbitrator to conclude the lease.
+    pub fn resolve_dispute(
+        env: Env,
+        lease_id: u64,
+        arbitrator: Address,
+        damage_deduction: i128,
+    ) -> Result<i128, LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Check if caller is a whitelisted arbitrator
+        if !lease.arbitrators.contains(&arbitrator) {
+            return Err(LeaseError::NotAnArbitrator);
+        }
+        
+        // Require signature from the arbitrator
+        arbitrator.require_auth();
+
+        // Validate deduction against the security deposit
+        if damage_deduction < 0 || damage_deduction > lease.security_deposit {
+            return Err(LeaseError::InvalidDeduction);
+        }
+
+        let refund_amount = lease.security_deposit - damage_deduction;
+
+        // Update state to terminate the lease and settle the deposit
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+
+        save_lease(&env, lease_id, &lease);
+
         Ok(refund_amount)
     }
 }

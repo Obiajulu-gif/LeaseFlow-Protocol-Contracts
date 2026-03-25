@@ -47,6 +47,9 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         expiry_time: 0,
         buyout_price: None,
         cumulative_payments: 0,
+        withdrawal_address: None,
+        rent_withdrawn: 0,
+        arbitrators: soroban_sdk::Vec::new(env),
     }
 }
 
@@ -767,6 +770,8 @@ fn test_set_lease_instance_buyout_price() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
+        security_deposit: 500,
+        arbitrators: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -793,6 +798,8 @@ fn test_lease_instance_buyout_execution() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
+        security_deposit: 500,
+        arbitrators: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -833,6 +840,8 @@ fn test_buyout_price_not_reached() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
+        security_deposit: 500,
+        arbitrators: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1047,6 +1056,7 @@ fn test_create_lease_instance_with_security_deposit() {
         start_date: START,
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
+        arbitrators: soroban_sdk::Vec::new(&env),
     };
 
     // Act
