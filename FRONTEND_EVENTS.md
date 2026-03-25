@@ -51,6 +51,53 @@ pub struct AssetReclaimed {
 
 **Frontend use case:** Notify that an asset is no longer available and show the reason.
 
+### 4. MaintenanceIssueReported
+Emitted when a tenant reports a maintenance issue.
+
+**Event Structure:**
+```rust
+pub struct MaintenanceIssueReported {
+    pub lease_id: u64,
+    pub tenant: Address,
+}
+```
+
+**When emitted:** When `report_maintenance_issue` is called.
+
+**Frontend use case:** Update dashboard to show a repair is pending.
+
+### 5. RepairProofSubmitted
+Emitted when a landlord uploads a proof-of-work hash.
+
+**Event Structure:**
+```rust
+pub struct RepairProofSubmitted {
+    pub lease_id: u64,
+    pub landlord: Address,
+    pub proof_hash: BytesN<32>,
+}
+```
+
+**When emitted:** When `submit_repair_proof` is called.
+
+**Frontend use case:** Notify tenant and inspector that repair is ready for verification.
+
+### 6. MaintenanceVerified
+Emitted when an inspector verifies the repair and withheld rent is released.
+
+**Event Structure:**
+```rust
+pub struct MaintenanceVerified {
+    pub lease_id: u64,
+    pub inspector: Address,
+    pub withheld_released: i128,
+}
+```
+
+**When emitted:** When `verify_repair` is called by the assigned inspector.
+
+**Frontend use case:** Update landlord balance and mark issue as resolved.
+
 ## Integration Guide
 
 ### Listening to Events
