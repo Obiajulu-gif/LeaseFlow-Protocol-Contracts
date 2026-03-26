@@ -307,3 +307,27 @@ fn test_terminate_paused_lease() {
     let result = client.try_get_lease_instance(&LEASE_ID);
     assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound))); // Archived
 }
+
+#[test]
+fn test_autopay_authorization() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    create_test_lease(&env, &client, &admin, &landlord, &tenant, &token);
+
+    // Test rent pull authorization
+    let authorized_amount = 1000_0000000;
+    client.authorize_rent_pull(&LEASE_ID, &tenant, &authorized_amount, &None);
+
+    // Verify authorization status
+    let (auth_amount, last_pull, cycle_duration, _next_available) = 
+        client.get_rent_pull_status(&LEASE_ID);
+
+    assert_eq!(auth_amount, Some(authorized_amount));
+    assert_eq!(last_pull, None);
+    assert_eq!(cycle_duration, 2_592_000u64); // Default 30 days
+}

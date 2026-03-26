@@ -140,6 +140,12 @@ pub struct LeaseInstance {
     pub inspector: Option<Address>,
     /// Hash of repair proof submitted by landlord
     pub repair_proof_hash: Option<BytesN<32>>,
+    /// Monthly rent pull authorization - amount approved for automatic withdrawal
+    pub rent_pull_authorized_amount: Option<i128>,
+    /// Timestamp of the last rent pull execution
+    pub last_rent_pull_timestamp: Option<u64>,
+    /// Billing cycle duration in seconds (default: 30 days = 2,592,000 seconds)
+    pub billing_cycle_duration: u64,
 }
 
 
@@ -293,6 +299,29 @@ pub struct EmergencyRentResumed {
     pub total_paused_duration: u64,
 }
 
+#[contractevent]
+pub struct RentPullAuthorized {
+    pub lease_id: u64,
+    pub tenant: Address,
+    pub authorized_amount: i128,
+    pub billing_cycle_duration: u64,
+}
+
+#[contractevent]
+pub struct RentPullExecuted {
+    pub lease_id: u64,
+    pub landlord: Address,
+    pub amount_pulled: i128,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+pub struct RentPullRevoked {
+    pub lease_id: u64,
+    pub tenant: Address,
+    pub timestamp: u64,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 
@@ -315,6 +344,9 @@ pub enum LeaseError {
     LeaseAlreadyPaused = 14,
     LeaseNotPaused = 15,
     InvalidPauseReason = 16,
+    RentPullNotAuthorized = 17,
+    BillingCycleNotElapsed = 18,
+    InsufficientAuthorizedAmount = 19,
 }
 
 
@@ -636,6 +668,10 @@ impl LeaseContract {
             withheld_rent: 0,
             inspector: None,
             repair_proof_hash: None,
+            // Initialize auto-pay fields
+            rent_pull_authorized_amount: None,
+            last_rent_pull_timestamp: None,
+            billing_cycle_duration: 2_592_000, // 30 days in seconds
         };
         save_lease_instance(&env, lease_id, &lease);
         Ok(())
@@ -1291,8 +1327,221 @@ impl LeaseContract {
             lease.total_paused_duration,
         ))
     }
+
+    /// Authorizes the contract to automatically pull rent from tenant's account.
+    /// This enables "Auto-Pay" functionality where rent is automatically withdrawn
+    /// every billing cycle without manual intervention.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease
+    /// * `tenant` - Tenant address authorizing the auto-pull
+    /// * `authorized_amount` - Amount approved for automatic withdrawal per billing cycle
+    /// * `billing_cycle_duration` - Optional custom billing cycle in seconds (defaults to 30 days)
+    /// 
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the tenant
+    /// 
+    /// # Security
+    /// Only the tenant can authorize rent pulls for their own lease.
+    /// The authorization can be revoked at any time by the tenant.
+    pub fn authorize_rent_pull(
+        env: Env,
+        lease_id: u64,
+        tenant: Address,
+        authorized_amount: i128,
+        billing_cycle_duration: Option<u64>,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only tenant can authorize rent pulls
+        if lease.tenant != tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        tenant.require_auth();
+        
+        // Set authorization details
+        lease.rent_pull_authorized_amount = Some(authorized_amount);
+        lease.last_rent_pull_timestamp = None; // Reset timestamp when re-authorizing
+        
+        // Use custom billing cycle or keep existing one
+        if let Some(cycle_duration) = billing_cycle_duration {
+            lease.billing_cycle_duration = cycle_duration;
+        }
+        
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Emit authorization event
+        RentPullAuthorized {
+            lease_id,
+            tenant,
+            authorized_amount,
+            billing_cycle_duration: lease.billing_cycle_duration,
+        }.publish(&env);
+        
+        Ok(())
+    }
+
+    /// Executes an automatic rent pull if conditions are met.
+    /// Can only be called once per billing cycle and only by the landlord.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease
+    /// * `landlord` - Landlord address executing the pull
+    /// * `token_contract_id` - The payment token contract address
+    /// 
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the landlord
+    /// * `LeaseError::RentPullNotAuthorized` - Tenant has not authorized rent pulls
+    /// * `LeaseError::BillingCycleNotElapsed` - Not enough time has passed since last pull
+    /// * `LeaseError::InsufficientAuthorizedAmount` - Authorized amount is less than required rent
+    /// 
+    /// # Returns
+    /// Returns the amount that was successfully pulled
+    pub fn execute_rent_pull(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        token_contract_id: Address,
+    ) -> Result<i128, LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only landlord can execute rent pulls
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
+        
+        // Check if rent pull is authorized
+        let authorized_amount = lease.rent_pull_authorized_amount
+            .ok_or(LeaseError::RentPullNotAuthorized)?;
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Check if billing cycle has elapsed since last pull
+        if let Some(last_pull) = lease.last_rent_pull_timestamp {
+            let time_since_last_pull = current_time.saturating_sub(last_pull);
+            if time_since_last_pull < lease.billing_cycle_duration {
+                return Err(LeaseError::BillingCycleNotElapsed);
+            }
+        }
+        
+        // Calculate expected rent for this billing cycle
+        let billing_cycle_rent = (lease.billing_cycle_duration as i128)
+            .saturating_mul(lease.rent_per_sec);
+        
+        // Ensure authorized amount covers the required rent
+        if authorized_amount < billing_cycle_rent {
+            return Err(LeaseError::InsufficientAuthorizedAmount);
+        }
+        
+        // Use the smaller of authorized amount or required rent
+        let pull_amount = authorized_amount.min(billing_cycle_rent);
+        
+        // Execute the token transfer from tenant to contract
+        let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
+        token_client.transfer(
+            &lease.tenant,
+            &env.current_contract_address(),
+            &pull_amount,
+        );
+        
+        // Update lease state
+        lease.rent_paid += pull_amount;
+        lease.cumulative_payments += pull_amount;
+        lease.last_rent_pull_timestamp = Some(current_time);
+        
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Emit pull execution event
+        RentPullExecuted {
+            lease_id,
+            landlord,
+            amount_pulled: pull_amount,
+            timestamp: current_time,
+        }.publish(&env);
+        
+        Ok(pull_amount)
+    }
+
+    /// Revokes the automatic rent pull authorization.
+    /// After revocation, the landlord can no longer automatically pull rent.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease
+    /// * `tenant` - Tenant address revoking the authorization
+    /// 
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the tenant
+    /// 
+    /// # Security
+    /// Only the tenant can revoke their own rent pull authorization.
+    pub fn revoke_rent_pull_authorization(
+        env: Env,
+        lease_id: u64,
+        tenant: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only tenant can revoke authorization
+        if lease.tenant != tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        tenant.require_auth();
+        
+        // Clear authorization
+        lease.rent_pull_authorized_amount = None;
+        lease.last_rent_pull_timestamp = None;
+        
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Emit revocation event
+        RentPullRevoked {
+            lease_id,
+            tenant,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+        
+        Ok(())
+    }
+
+    /// Gets the current auto-pay authorization status for a lease.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease
+    /// 
+    /// # Returns
+    /// Returns a tuple containing:
+    /// * `authorized_amount: Option<i128>` - Amount authorized for auto-pull (None if not authorized)
+    /// * `last_pull_timestamp: Option<u64>` - Timestamp of last successful pull
+    /// * `billing_cycle_duration: u64` - Duration of billing cycle in seconds
+    /// * `next_pull_available: Option<u64>` - Timestamp when next pull becomes available
+    pub fn get_rent_pull_status(
+        env: Env,
+        lease_id: u64,
+    ) -> Result<(Option<i128>, Option<u64>, u64, Option<u64>), LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        let next_pull_available = lease.last_rent_pull_timestamp
+            .map(|last_pull| last_pull.saturating_add(lease.billing_cycle_duration));
+        
+        Ok((
+            lease.rent_pull_authorized_amount,
+            lease.last_rent_pull_timestamp,
+            lease.billing_cycle_duration,
+            next_pull_available,
+        ))
+    }
 }
 
 // mod test;  // Commented out due to compilation errors
 mod emergency_pause_tests;
+#[cfg(test)]
+mod auto_pay_tests;
 
