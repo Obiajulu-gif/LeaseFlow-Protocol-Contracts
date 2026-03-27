@@ -1,10 +1,11 @@
 {
   "generators": {
-    "address": 5,
+    "address": 6,
     "nonce": 0,
     "mux_id": 0
   },
   "auth": [
+    [],
     [],
     [],
     [
@@ -20,7 +21,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                 }
               ]
             }
@@ -36,10 +37,10 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "initialize_lease",
+              "function_name": "create_lease_with_nft",
               "args": [
                 {
-                  "symbol": "lease1"
+                  "symbol": "tst_lease"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -48,19 +49,42 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "i128": "5000"
+                  "i128": "1000"
                 },
                 {
-                  "i128": "10000"
+                  "vec": [
+                    {
+                      "symbol": "PerDay"
+                    }
+                  ]
                 },
                 {
-                  "u64": "31536000"
+                  "u64": "86400"
                 },
                 {
-                  "string": "ipfs://test"
+                  "u64": "2000"
+                },
+                {
+                  "i128": "100"
+                },
+                {
+                  "i128": "50"
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "PerDay"
+                    }
+                  ]
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u128": "456"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                 }
               ]
             }
@@ -71,7 +95,28 @@
     ],
     [],
     [],
-    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "end_lease",
+              "args": [
+                {
+                  "symbol": "tst_lease"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
     [],
     []
   ],
@@ -102,7 +147,7 @@
                   "storage": [
                     {
                       "key": {
-                        "symbol": "lease1"
+                        "symbol": "tst_lease"
                       },
                       "val": {
                         "map": [
@@ -111,7 +156,7 @@
                               "symbol": "active"
                             },
                             "val": {
-                              "bool": true
+                              "bool": false
                             }
                           },
                           {
@@ -125,7 +170,7 @@
                               "symbol": "cumulative_payments"
                             },
                             "val": {
-                              "i128": "5000"
+                              "i128": "0"
                             }
                           },
                           {
@@ -141,7 +186,7 @@
                               "symbol": "deposit_amount"
                             },
                             "val": {
-                              "i128": "10000"
+                              "i128": "0"
                             }
                           },
                           {
@@ -149,7 +194,7 @@
                               "symbol": "end_date"
                             },
                             "val": {
-                              "u64": "1743465600"
+                              "u64": "1712016000"
                             }
                           },
                           {
@@ -157,7 +202,7 @@
                               "symbol": "expiry_time"
                             },
                             "val": {
-                              "u64": "1743465600"
+                              "u64": "1712016000"
                             }
                           },
                           {
@@ -173,7 +218,7 @@
                               "symbol": "grace_period_end"
                             },
                             "val": {
-                              "u64": "1743465600"
+                              "u64": "2000"
                             }
                           },
                           {
@@ -189,7 +234,7 @@
                               "symbol": "late_fee_flat"
                             },
                             "val": {
-                              "i128": "0"
+                              "i128": "100"
                             }
                           },
                           {
@@ -204,14 +249,16 @@
                             "key": {
                               "symbol": "nft_contract"
                             },
-                            "val": "void"
+                            "val": {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                            }
                           },
                           {
                             "key": {
                               "symbol": "payment_token"
                             },
                             "val": {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                             }
                           },
                           {
@@ -219,7 +266,7 @@
                               "symbol": "property_uri"
                             },
                             "val": {
-                              "string": "ipfs://test"
+                              "string": ""
                             }
                           },
                           {
@@ -261,7 +308,7 @@
                             "val": {
                               "vec": [
                                 {
-                                  "symbol": "Active"
+                                  "symbol": "Terminated"
                                 }
                               ]
                             }
@@ -278,7 +325,9 @@
                             "key": {
                               "symbol": "token_id"
                             },
-                            "val": "void"
+                            "val": {
+                              "u128": "456"
+                            }
                           }
                         ]
                       }
@@ -302,63 +351,12 @@
                             "symbol": "AllowedAsset"
                           },
                           {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                           }
                         ]
                       },
                       "val": {
                         "bool": true
-                      }
-                    },
-                    {
-                      "key": {
-                        "vec": [
-                          {
-                            "symbol": "Receipt"
-                          },
-                          {
-                            "symbol": "lease1"
-                          },
-                          {
-                            "u32": 1
-                          }
-                        ]
-                      },
-                      "val": {
-                        "map": [
-                          {
-                            "key": {
-                              "symbol": "amount"
-                            },
-                            "val": {
-                              "i128": "5000"
-                            }
-                          },
-                          {
-                            "key": {
-                              "symbol": "date"
-                            },
-                            "val": {
-                              "u64": "1711929600"
-                            }
-                          },
-                          {
-                            "key": {
-                              "symbol": "lease_id"
-                            },
-                            "val": {
-                              "symbol": "lease1"
-                            }
-                          },
-                          {
-                            "key": {
-                              "symbol": "month"
-                            },
-                            "val": {
-                              "u32": 1
-                            }
-                          }
-                        ]
                       }
                     }
                   ]
@@ -368,7 +366,27 @@
           },
           "ext": "v0"
         },
-        "live_until": 6307200
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "1033654523790656264"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
       },
       {
         "entry": {
@@ -389,6 +407,38 @@
           "ext": "v0"
         },
         "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "key": "ledger_key_contract_instance",
+              "durability": "persistent",
+              "val": {
+                "contract_instance": {
+                  "executable": {
+                    "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  },
+                  "storage": [
+                    {
+                      "key": {
+                        "u128": "456"
+                      },
+                      "val": {
+                        "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
       },
       {
         "entry": {
@@ -422,7 +472,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 6307200
+        "live_until": 4095
       }
     ]
   },
