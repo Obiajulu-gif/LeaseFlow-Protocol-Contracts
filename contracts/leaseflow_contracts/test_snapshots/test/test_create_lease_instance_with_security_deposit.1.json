@@ -287,35 +287,6 @@
         }
       ]
     ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "set_lease_instance_buyout_price",
-              "args": [
-                {
-                  "u64": "1"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                },
-                {
-                  "i128": "3000"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
-    [],
-    [],
-    [],
-    [],
     []
   ],
   "ledger": {
@@ -338,7 +309,7 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "HistoricalLease"
+                    "symbol": "LeaseInstance"
                   },
                   {
                     "u64": "1"
@@ -350,282 +321,223 @@
                 "map": [
                   {
                     "key": {
-                      "symbol": "lease"
+                      "symbol": "active"
                     },
                     "val": {
-                      "map": [
+                      "bool": true
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "arbitrators"
+                    },
+                    "val": {
+                      "vec": []
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "buyout_price"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "cumulative_payments"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "debt"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "deposit_amount"
+                    },
+                    "val": {
+                      "i128": "2000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "deposit_status"
+                    },
+                    "val": {
+                      "vec": [
                         {
-                          "key": {
-                            "symbol": "active"
-                          },
-                          "val": {
-                            "bool": false
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "arbitrators"
-                          },
-                          "val": {
-                            "vec": []
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "buyout_price"
-                          },
-                          "val": {
-                            "i128": "3000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "cumulative_payments"
-                          },
-                          "val": {
-                            "i128": "3000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "debt"
-                          },
-                          "val": {
-                            "i128": "0"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "deposit_amount"
-                          },
-                          "val": {
-                            "i128": "2000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "deposit_status"
-                          },
-                          "val": {
-                            "vec": [
-                              {
-                                "symbol": "Held"
-                              }
-                            ]
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "end_date"
-                          },
-                          "val": {
-                            "u64": "1714521600"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "expiry_time"
-                          },
-                          "val": {
-                            "u64": "1714521600"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "flat_fee_applied"
-                          },
-                          "val": {
-                            "bool": false
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "grace_period_end"
-                          },
-                          "val": {
-                            "u64": "1714521600"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "inspector"
-                          },
-                          "val": "void"
-                        },
-                        {
-                          "key": {
-                            "symbol": "landlord"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "late_fee_flat"
-                          },
-                          "val": {
-                            "i128": "0"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "late_fee_per_sec"
-                          },
-                          "val": {
-                            "i128": "0"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "maintenance_status"
-                          },
-                          "val": {
-                            "vec": [
-                              {
-                                "symbol": "None"
-                              }
-                            ]
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "nft_contract"
-                          },
-                          "val": "void"
-                        },
-                        {
-                          "key": {
-                            "symbol": "payment_token"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "property_uri"
-                          },
-                          "val": {
-                            "string": "ipfs://test"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "rent_amount"
-                          },
-                          "val": {
-                            "i128": "1000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "rent_paid"
-                          },
-                          "val": {
-                            "i128": "3000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "rent_paid_through"
-                          },
-                          "val": {
-                            "u64": "0"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "rent_per_sec"
-                          },
-                          "val": {
-                            "i128": "1"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "rent_withdrawn"
-                          },
-                          "val": {
-                            "i128": "0"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "repair_proof_hash"
-                          },
-                          "val": "void"
-                        },
-                        {
-                          "key": {
-                            "symbol": "seconds_late_charged"
-                          },
-                          "val": {
-                            "u64": "0"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "security_deposit"
-                          },
-                          "val": {
-                            "i128": "500"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "start_date"
-                          },
-                          "val": {
-                            "u64": "1711929600"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "status"
-                          },
-                          "val": {
-                            "vec": [
-                              {
-                                "symbol": "Terminated"
-                              }
-                            ]
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "tenant"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "token_id"
-                          },
-                          "val": "void"
-                        },
-                        {
-                          "key": {
-                            "symbol": "withdrawal_address"
-                          },
-                          "val": "void"
-                        },
-                        {
-                          "key": {
-                            "symbol": "withheld_rent"
-                          },
-                          "val": {
-                            "i128": "0"
-                          }
+                          "symbol": "Held"
                         }
                       ]
                     }
                   },
                   {
                     "key": {
-                      "symbol": "terminated_at"
+                      "symbol": "end_date"
+                    },
+                    "val": {
+                      "u64": "1714521600"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "expiry_time"
+                    },
+                    "val": {
+                      "u64": "1714521600"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "flat_fee_applied"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "grace_period_end"
+                    },
+                    "val": {
+                      "u64": "1714521600"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "inspector"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "landlord"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "late_fee_flat"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "late_fee_per_sec"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "maintenance_status"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "None"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "nft_contract"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "payment_token"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "property_uri"
+                    },
+                    "val": {
+                      "string": "ipfs://test"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "rent_amount"
+                    },
+                    "val": {
+                      "i128": "1000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "rent_paid"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "rent_paid_through"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "rent_per_sec"
+                    },
+                    "val": {
+                      "i128": "1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "rent_withdrawn"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "repair_proof_hash"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "seconds_late_charged"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "security_deposit"
+                    },
+                    "val": {
+                      "i128": "500"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "start_date"
                     },
                     "val": {
                       "u64": "1711929600"
@@ -633,10 +545,42 @@
                   },
                   {
                     "key": {
-                      "symbol": "terminated_by"
+                      "symbol": "status"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                      "vec": [
+                        {
+                          "symbol": "Pending"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "tenant"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "token_id"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "withdrawal_address"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "withheld_rent"
+                    },
+                    "val": {
+                      "i128": "0"
                     }
                   }
                 ]
@@ -645,7 +589,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 4095
+        "live_until": 6307200
       },
       {
         "entry": {
@@ -697,26 +641,6 @@
           "ext": "v0"
         },
         "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "4837995959683129791"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
       },
       {
         "entry": {
