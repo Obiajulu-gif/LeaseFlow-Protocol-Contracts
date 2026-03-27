@@ -99,6 +99,7 @@ pub struct LeaseInstance {
     pub status: LeaseStatus,
     pub nft_contract: Option<Address>,
     pub token_id: Option<u128>,
+    pub payment_token: Address,
     pub active: bool,
     pub rent_paid: i128,
     pub expiry_time: u64,
@@ -114,6 +115,10 @@ pub struct LeaseInstance {
     pub late_fee_per_sec: i128,
     pub flat_fee_applied: bool,
     pub seconds_late_charged: u64,
+    pub maintenance_status: MaintenanceStatus,
+    pub withheld_rent: i128,
+    pub inspector: Option<Address>,
+    pub repair_proof_hash: Option<BytesN<32>>,
     /// Pre-approved destination for landlord's rent withdrawals.
     pub withdrawal_address: Option<Address>,
     /// Total rent withdrawn by the landlord.
@@ -595,6 +600,10 @@ impl LeaseContract {
         landlord.require_auth();
         // Require tenant agreement to the terms, including the arbitrator whitelist
         params.tenant.require_auth();
+
+        Self::require_kyc(&env, &landlord, &params.tenant)?;
+        Self::require_stablecoin(&env, &params.payment_token)?;
+
         let lease = LeaseInstance {
             landlord,
             tenant: params.tenant,
@@ -603,24 +612,29 @@ impl LeaseContract {
             security_deposit: params.security_deposit,
             start_date: params.start_date,
             end_date: params.end_date,
-            rent_paid_through: 0,
-            deposit_status: DepositStatus::Held,
-            status: LeaseStatus::Pending,
             property_uri: params.property_uri,
+            status: LeaseStatus::Pending,
             nft_contract: None,
             token_id: None,
+            payment_token: params.payment_token,
             active: true,
-            debt: 0,
             rent_paid: 0,
             expiry_time: params.end_date,
             buyout_price: None,
             cumulative_payments: 0,
+            debt: 0,
+            rent_paid_through: 0,
+            deposit_status: DepositStatus::Held,
             rent_per_sec: params.rent_per_sec,
             grace_period_end: params.grace_period_end,
             late_fee_flat: params.late_fee_flat,
             late_fee_per_sec: params.late_fee_per_sec,
             flat_fee_applied: false,
             seconds_late_charged: 0,
+            maintenance_status: MaintenanceStatus::None,
+            withheld_rent: 0,
+            inspector: None,
+            repair_proof_hash: None,
             withdrawal_address: None,
             rent_withdrawn: 0,
             arbitrators: params.arbitrators,
@@ -727,6 +741,10 @@ impl LeaseContract {
         // Authorize landlord
         lease.landlord.require_auth();
 
+        if lease.payment_token != token_contract_id {
+            return Err(LeaseError::PaymentTokenMismatch);
+        }
+
         let withdrawal_address = lease
             .withdrawal_address
             .clone()
@@ -750,6 +768,70 @@ impl LeaseContract {
         save_lease_instance(&env, lease_id, &lease);
 
         Ok(())
+    }
+
+    /// Batch withdraw accumulated rent for multiple lease instances.
+    ///
+    /// Optimised to do a single token transfer for all leases to reduce gas.
+    pub fn batch_withdraw_rent(
+        env: Env,
+        landlord: Address,
+        lease_ids: soroban_sdk::Vec<u64>,
+        token_contract_id: Address,
+    ) -> Result<i128, LeaseError> {
+        landlord.require_auth();
+
+        let contract_address = env.current_contract_address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
+
+        let mut total_withdrawable: i128 = 0;
+        let mut withdrawal_address: Option<Address> = None;
+
+        for lease_id in lease_ids.iter() {
+            let mut lease =
+                load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+            if lease.landlord != landlord {
+                return Err(LeaseError::Unauthorised);
+            }
+
+            if lease.payment_token != token_contract_id {
+                return Err(LeaseError::PaymentTokenMismatch);
+            }
+
+            let lease_withdrawal_address = lease
+                .withdrawal_address
+                .clone()
+                .ok_or(LeaseError::WithdrawalAddressNotSet)?;
+
+            match &withdrawal_address {
+                None => withdrawal_address = Some(lease_withdrawal_address),
+                Some(expected) => {
+                    if expected != &lease_withdrawal_address {
+                        return Err(LeaseError::WithdrawalAddressMismatch);
+                    }
+                }
+            }
+
+            let withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
+            if withdrawable_amount > 0 {
+                total_withdrawable += withdrawable_amount;
+                lease.rent_withdrawn += withdrawable_amount;
+                save_lease_instance(&env, lease_id, &lease);
+            }
+        }
+
+        if total_withdrawable <= 0 {
+            panic!("No rent to withdraw");
+        }
+
+        token_client.transfer(
+            &contract_address,
+            &withdrawal_address.expect("withdrawal address not set"),
+            &total_withdrawable,
+        );
+
+        Ok(total_withdrawable)
     }
 
     /// Terminates an expired lease and clears or archives its state from ledger storage.
@@ -810,6 +892,7 @@ impl LeaseContract {
         
         archive_lease(&env, lease_id, lease, caller);
         LeaseTerminated { lease_id }.publish(&env);
+        LeaseEnded { id: lease_id, duration: lease_duration, total_paid }.publish(&env);
         Ok(())
     }
 
@@ -827,12 +910,18 @@ impl LeaseContract {
         landlord.require_auth();
         Self::require_kyc(&env, &lease.landlord, &lease.tenant)?;
 
-        if damage_deduction < 0 || damage_deduction > lease.deposit_amount { return Err(LeaseError::InvalidDeduction); }
+        if env.ledger().timestamp() < lease.end_date { return Err(LeaseError::LeaseNotExpired); }
+        if lease.rent_paid_through < lease.end_date { return Err(LeaseError::RentOutstanding); }
+
+        if damage_deduction < 0 || damage_deduction > lease.security_deposit { return Err(LeaseError::InvalidDeduction); }
+
+        let refund_amount = lease.security_deposit - damage_deduction;
 
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
         save_lease_instance(&env, lease_id, &lease);
-        Ok(lease.deposit_amount - damage_deduction)
+        Ok(refund_amount)
     }
 
     pub fn set_inspector(env: Env, lease_id: u64, landlord: Address, inspector: Address) -> Result<(), LeaseError> {
@@ -895,7 +984,7 @@ impl LeaseContract {
         // If 0, transfer Asset NFT back to owner.
         if let (Some(nft_contract_addr), Some(token_id)) = (lease.nft_contract.clone(), lease.token_id) {
             delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
-            
+
             let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
             nft_client.transfer_from(
                 &env.current_contract_address(),
