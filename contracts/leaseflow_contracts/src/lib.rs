@@ -10,8 +10,6 @@ use soroban_sdk::{
     BytesN, Env, String, Symbol,
 };
 
-// ── Enums ──────────────────────────────────────────────────────────────
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
@@ -60,8 +58,6 @@ pub struct DepositReleasePartial {
     pub tenant_amount: i128,
     pub landlord_amount: i128,
 }
-
-// ── Structs ───────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
