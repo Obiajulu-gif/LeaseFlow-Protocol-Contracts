@@ -10,8 +10,6 @@ use soroban_sdk::{
     BytesN, Env, String, Symbol,
 };
 
-// ── Enums ──────────────────────────────────────────────────────────────
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
@@ -824,9 +822,16 @@ impl LeaseContract {
         token_id: u128,
         payment_token: Address,
     ) -> Result<Symbol, LeaseError> {
+        // --- ISSUE #29: DOUBLE SIGN PREVENTION ---
+        if env.storage().instance().has(&lease_id) {
+            return Err(LeaseError::LeaseAlreadyExists);
+        }
+        // -----------------------------------------
+
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
         Self::require_stablecoin(&env, &payment_token)?;
+
         let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
         nft_client.transfer_from(
             &env.current_contract_address(),
@@ -834,6 +839,7 @@ impl LeaseContract {
             &env.current_contract_address(),
             &token_id,
         );
+
         let now = env.ledger().timestamp();
         let expiry_time = now.saturating_add(duration);
         let lease = Lease {
@@ -860,6 +866,7 @@ impl LeaseContract {
             cumulative_payments: 0,
             payment_token,
         };
+
         save_usage_rights(
             &env,
             nft_contract_addr.clone(),
@@ -872,6 +879,7 @@ impl LeaseContract {
                 valid_until: expiry_time,
             },
         );
+
         env.storage().instance().set(&lease_id, &lease);
         Ok(symbol_short!("created"))
     }
@@ -1109,7 +1117,7 @@ impl LeaseContract {
     }
 
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
-        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
+        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound);
     }
 
     pub fn set_lease_instance_buyout_price(
