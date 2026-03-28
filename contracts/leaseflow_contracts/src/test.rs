@@ -19,7 +19,6 @@ const START: u64 = 1711929600;
 const END: u64 = 1714521600;
 const LEASE_ID: u64 = 1;
 
-// --- KYC Mock ---
 #[contract]
 pub struct KycMock;
 
@@ -524,11 +523,9 @@ fn test_maintenance_flow_with_events() {
     client.set_withdrawal_address(&lease_id_1, &withdrawal);
     client.set_withdrawal_address(&lease_id_2, &withdrawal);
 
-    // Record rent owed.
     client.pay_lease_instance_rent(&lease_id_1, &100i128);
     client.pay_lease_instance_rent(&lease_id_2, &200i128);
 
-    // Fund the lease contract with enough tokens to pay out.
     let token_client = TokenMockClient::new(&env, &token_contract_id);
     token_client.mint(&lease_contract_id, &300i128);
 
