@@ -185,7 +185,6 @@ pub struct HistoricalLease {
     pub terminated_at: u64,
 }
 
-// ── Events ────────────────────────────────────────────────────────────────────
 
 #[contractevent]
 pub struct RoommateAdded {
@@ -264,7 +263,6 @@ pub struct EvictionEligible {
     pub debt: i128,
 }
 
-// ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +284,6 @@ pub enum LeaseError {
     LeaseAlreadyExists = 15,
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 macro_rules! require {
     ($condition:expr, $error_msg:expr) => {
@@ -393,7 +390,6 @@ mod kyc_contract {
     }
 }
 
-// ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct LeaseContract;
@@ -459,7 +455,6 @@ impl LeaseContract {
         Ok(())
     }
 
-    // --- SIMPLE LEASE (Symbol-based) ---
 
     pub fn initialize_lease(
         env: Env,
@@ -560,11 +555,9 @@ impl LeaseContract {
         token_id: u128,
         payment_token: Address,
     ) -> Result<Symbol, LeaseError> {
-        // --- ISSUE #29: DOUBLE SIGN PREVENTION ---
         if env.storage().instance().has(&lease_id) {
             return Err(LeaseError::LeaseAlreadyExists);
         }
-        // -----------------------------------------
 
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
@@ -779,7 +772,6 @@ impl LeaseContract {
         None
     }
 
-    // --- LEASE INSTANCE (u64-based) ---
 
     pub fn create_lease_instance(
         env: Env,
@@ -888,7 +880,6 @@ impl LeaseContract {
         lease.cumulative_payments += payment_amount;
         lease.rent_paid += payment_amount;
 
-        // token_client.transfer(&payer, &env.current_contract_address(), &payment_amount);
 
         RentPaidPartial {
             lease_id,
@@ -952,7 +943,6 @@ impl LeaseContract {
             .ok_or(LeaseError::WithdrawalAddressNotSet)?;
         let _withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
 
-        // token_client.transfer(&env.current_contract_address(), &_withdrawal_address, &_withdrawable_amount);
 
         lease.rent_withdrawn += _withdrawable_amount;
         save_lease_instance(&env, lease_id, &lease);
