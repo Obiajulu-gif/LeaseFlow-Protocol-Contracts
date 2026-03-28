@@ -63,6 +63,18 @@ pub enum MaintenanceStatus {
     Verified,
 }
 
+// [ISSUE 38] Multi-Sig Maintenance Fund Treasury
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceFund {
+    pub fund_address: Address,
+    pub signatories: soroban_sdk::Vec<Address>,
+    pub threshold: u32, // Number of signatures required
+    pub total_collected: i128,
+    pub total_withdrawn: i128,
+    pub maintenance_percentage_bps: u32, // Default 1000 = 10%
+}
+
 #[contracttype]
 pub enum DepositRelease {
     FullRefund,
@@ -211,6 +223,13 @@ pub struct LeaseInstance {
     pub sublet_end_date: Option<u64>,
     pub sublet_landlord_percentage_bps: u32,
     pub sublet_tenant_percentage_bps: u32,
+    /// [ISSUE 38] Multi-Sig Maintenance Fund Treasury
+    pub maintenance_fund: Option<MaintenanceFund>,
+    pub maintenance_fund_balance: i128,
+    /// [ISSUE 39] Rent Increase Cap Enforcement
+    pub max_annual_increase_bps: u32, // Default 1000 = 10%
+    pub previous_rent_amount: i128,
+    pub last_renewal_date: u64,
 }
 
 #[contracttype]
@@ -278,6 +297,8 @@ pub enum DataKey {
     RoommateBalance(u64, Address),
     UtilityBill(u64, u64), // lease_id, bill_id
     SubletAgreement(u64),  // lease_id
+    // [ISSUE 38] Multi-Sig Maintenance Fund
+    MaintenanceFund(u64), // lease_id
 }
 
 #[contracttype]
@@ -478,6 +499,45 @@ pub struct SubletTerminated {
     pub terminated_at: u64,
 }
 
+#[contractevent]
+pub struct MaintenanceFundCreated {
+    pub lease_id: u64,
+    pub fund_address: Address,
+    pub maintenance_percentage_bps: u32,
+}
+
+#[contractevent]
+pub struct MaintenanceContribution {
+    pub lease_id: u64,
+    pub amount: i128,
+    pub total_fund_balance: i128,
+}
+
+#[contractevent]
+pub struct MaintenanceWithdrawn {
+    pub lease_id: u64,
+    pub amount: i128,
+    pub withdrawn_by: Address,
+}
+
+#[contractevent]
+pub struct RentIncreaseCapEnforced {
+    pub lease_id: u64,
+    pub old_rent: i128,
+    pub new_rent: i128,
+    pub increase_percentage_bps: u32,
+    pub max_allowed_bps: u32,
+}
+
+#[contractevent]
+pub struct RentIncreaseRejected {
+    pub lease_id: u64,
+    pub requested_rent: i128,
+    pub previous_rent: i128,
+    pub increase_percentage_bps: u32,
+    pub max_allowed_bps: u32,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -520,6 +580,15 @@ pub enum LeaseError {
     InvalidPercentageSplit = 35,
     SubletTenantUnauthorized = 36,
     LeaseAlreadyExists = 37,
+    // [ISSUE 38] Multi-Sig Maintenance Fund Errors
+    MaintenanceFundAlreadyExists = 38,
+    MaintenanceFundNotFound = 39,
+    InsufficientMaintenanceBalance = 40,
+    UnauthorizedMaintenanceWithdrawal = 41,
+    InvalidMaintenancePercentage = 42,
+    // [ISSUE 39] Rent Increase Cap Errors
+    RentIncreaseExceedsCap = 43,
+    InvalidRenewalDate = 44,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -639,6 +708,22 @@ pub fn load_sublet_agreement(env: &Env, lease_id: u64) -> Option<SubletAgreement
     env.storage()
         .persistent()
         .get(&DataKey::SubletAgreement(lease_id))
+}
+
+// [ISSUE 38] Multi-Sig Maintenance Fund Helper Functions
+
+pub fn save_maintenance_fund(env: &Env, lease_id: u64, fund: &MaintenanceFund) {
+    let key = DataKey::MaintenanceFund(lease_id);
+    env.storage().persistent().set(&key, fund);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_maintenance_fund(env: &Env, lease_id: u64) -> Option<MaintenanceFund> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MaintenanceFund(lease_id))
 }
 
 mod nft_contract {
@@ -1103,6 +1188,13 @@ impl LeaseContract {
             sublet_end_date: None,
             sublet_landlord_percentage_bps: 8000, // Default 80% to landlord
             sublet_tenant_percentage_bps: 2000,   // Default 20% to original tenant
+            // [ISSUE 38] Multi-Sig Maintenance Fund Initialization
+            maintenance_fund: None,
+            maintenance_fund_balance: 0,
+            // [ISSUE 39] Rent Increase Cap Initialization
+            max_annual_increase_bps: 1000, // Default 10% annual increase cap
+            previous_rent_amount: params.rent_amount,
+            last_renewal_date: params.start_date,
         };
         save_lease_instance(&env, lease_id, &lease);
         Ok(())
@@ -1175,6 +1267,31 @@ impl LeaseContract {
         // Rent portion available for landlord withdrawal (excludes equity)
         let rent_to_lanlord = payment_amount - equity_amount;
         lease.rent_paid += rent_to_lanlord;
+
+        // [ISSUE 38] Multi-Sig Maintenance Fund Contribution
+        let maintenance_contribution = if lease.maintenance_fund.is_some() {
+            let fund = lease.maintenance_fund.as_ref().unwrap();
+            (payment_amount * (fund.maintenance_percentage_bps as i128)) / 10000
+        } else {
+            0
+        };
+
+        if maintenance_contribution > 0 {
+            lease.maintenance_fund_balance += maintenance_contribution;
+            
+            // Update the maintenance fund record
+            if let Some(mut fund) = lease.maintenance_fund.clone() {
+                fund.total_collected += maintenance_contribution;
+                lease.maintenance_fund = Some(fund);
+                save_maintenance_fund(&env, lease_id, &lease.maintenance_fund.as_ref().unwrap());
+            }
+
+            MaintenanceContribution {
+                lease_id,
+                amount: maintenance_contribution,
+                total_fund_balance: lease.maintenance_fund_balance,
+            }.publish(&env);
+        }
 
         // token_client.transfer(&payer, &env.current_contract_address(), &payment_amount);
 
@@ -2038,6 +2155,223 @@ impl LeaseContract {
     /// Get sublet agreement details
     pub fn get_sublet_agreement(env: Env, lease_id: u64) -> Result<SubletAgreement, LeaseError> {
         load_sublet_agreement(&env, lease_id).ok_or(LeaseError::SubletAgreementNotFound)
+    }
+
+    // --- [ISSUE 38] Multi-Sig Maintenance Fund Treasury ---
+
+    /// Create a multi-sig maintenance fund for a lease
+    pub fn create_maintenance_fund(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        fund_address: Address,
+        signatories: soroban_sdk::Vec<Address>,
+        threshold: u32,
+        maintenance_percentage_bps: u32,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        if lease.maintenance_fund.is_some() {
+            return Err(LeaseError::MaintenanceFundAlreadyExists);
+        }
+        
+        // Validate maintenance percentage (must be between 0 and 10000 = 100%)
+        if maintenance_percentage_bps > 10000 {
+            return Err(LeaseError::InvalidMaintenancePercentage);
+        }
+        
+        // Validate threshold (must be at least 1 and not exceed number of signatories)
+        if threshold == 0 || threshold > signatories.len() as u32 {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        landlord.require_auth();
+        
+        let maintenance_fund = MaintenanceFund {
+            fund_address: fund_address.clone(),
+            signatories: signatories.clone(),
+            threshold,
+            total_collected: 0,
+            total_withdrawn: 0,
+            maintenance_percentage_bps,
+        };
+        
+        // Update lease
+        lease.maintenance_fund = Some(maintenance_fund.clone());
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Save maintenance fund separately for easy access
+        save_maintenance_fund(&env, lease_id, &maintenance_fund);
+        
+        // Publish event
+        MaintenanceFundCreated {
+            lease_id,
+            fund_address,
+            maintenance_percentage_bps,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Withdraw from maintenance fund (requires multi-sig authorization)
+    pub fn withdraw_maintenance_fund(
+        env: Env,
+        lease_id: u64,
+        requester: Address,
+        amount: i128,
+        signatures: soroban_sdk::Vec<Address>,
+    ) -> Result<(), LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        let mut fund = load_maintenance_fund(&env, lease_id).ok_or(LeaseError::MaintenanceFundNotFound)?;
+        
+        // Validate amount
+        if amount <= 0 || amount > lease.maintenance_fund_balance {
+            return Err(LeaseError::InsufficientMaintenanceBalance);
+        }
+        
+        // Check if requester is authorized signatory
+        if !fund.signatories.contains(&requester) {
+            return Err(LeaseError::UnauthorizedMaintenanceWithdrawal);
+        }
+        
+        // Validate signatures (in a real implementation, this would involve cryptographic signature verification)
+        let mut valid_signatures = 0;
+        for signatory in signatures.iter() {
+            if fund.signatories.contains(&signatory) {
+                valid_signatures += 1;
+            }
+        }
+        
+        if valid_signatures < fund.threshold {
+            return Err(LeaseError::UnauthorizedMaintenanceWithdrawal);
+        }
+        
+        requester.require_auth();
+        
+        // Update fund state
+        fund.total_withdrawn += amount;
+        lease.maintenance_fund_balance -= amount;
+        lease.maintenance_fund = Some(fund.clone());
+        
+        // Save changes
+        save_maintenance_fund(&env, lease_id, &fund);
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        MaintenanceWithdrawn {
+            lease_id,
+            amount,
+            withdrawn_by: requester,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Get maintenance fund details
+    pub fn get_maintenance_fund(env: Env, lease_id: u64) -> Result<MaintenanceFund, LeaseError> {
+        load_maintenance_fund(&env, lease_id).ok_or(LeaseError::MaintenanceFundNotFound)
+    }
+
+    // --- [ISSUE 39] Rent Increase Cap Enforcement ---
+
+    /// Renew lease with rent increase cap enforcement
+    pub fn renew_lease(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        new_rent_amount: i128,
+        new_end_date: u64,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Validate renewal date (must be in the future and after current end date)
+        if new_end_date <= now || new_end_date <= lease.end_date {
+            return Err(LeaseError::InvalidRenewalDate);
+        }
+        
+        // Calculate rent increase percentage
+        let rent_difference = new_rent_amount.saturating_sub(lease.previous_rent_amount);
+        let increase_percentage_bps = if lease.previous_rent_amount > 0 {
+            (rent_difference * 10000) / lease.previous_rent_amount
+        } else {
+            0
+        };
+        
+        // Check if increase exceeds cap
+        if increase_percentage_bps > lease.max_annual_increase_bps {
+            RentIncreaseRejected {
+                lease_id,
+                requested_rent: new_rent_amount,
+                previous_rent: lease.previous_rent_amount,
+                increase_percentage_bps,
+                max_allowed_bps: lease.max_annual_increase_bps,
+            }.publish(&env);
+            return Err(LeaseError::RentIncreaseExceedsCap);
+        }
+        
+        landlord.require_auth();
+        
+        // Update lease with new terms
+        lease.previous_rent_amount = lease.rent_amount;
+        lease.rent_amount = new_rent_amount;
+        lease.end_date = new_end_date;
+        lease.last_renewal_date = now;
+        
+        // Recalculate rent per second if needed
+        lease.rent_per_sec = if lease.billing_cycle_duration > 0 {
+            new_rent_amount / (lease.billing_cycle_duration as i128)
+        } else {
+            0
+        };
+        
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Publish event
+        RentIncreaseCapEnforced {
+            lease_id,
+            old_rent: lease.previous_rent_amount,
+            new_rent: new_rent_amount,
+            increase_percentage_bps,
+            max_allowed_bps: lease.max_annual_increase_bps,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Update maximum annual increase cap (only callable by landlord)
+    pub fn update_rent_increase_cap(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        new_max_annual_increase_bps: u32,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Validate new cap (must be between 0 and 10000 = 100%)
+        if new_max_annual_increase_bps > 10000 {
+            return Err(LeaseError::InvalidPercentage);
+        }
+        
+        landlord.require_auth();
+        
+        lease.max_annual_increase_bps = new_max_annual_increase_bps;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        Ok(())
     }
 }
 
