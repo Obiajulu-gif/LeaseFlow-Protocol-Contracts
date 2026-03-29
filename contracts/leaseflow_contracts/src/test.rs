@@ -1608,3 +1608,90 @@ fn test_iot_oracle_functionality() {
     assert!(client.is_tenant_current_on_rent());
     assert_eq!(client.get_lease_status(), symbol_short!("active"));
 }
+
+// ---------------------------------------------------------------------------
+// [ISSUE 5] Terminate Bounty Tests
+// ---------------------------------------------------------------------------
+
+/// Minimal SEP-41-compatible token mock for bounty transfer tests.
+#[contract]
+pub struct TokenMock;
+
+#[contractimpl]
+impl TokenMock {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal: i128 = env.storage().instance().get(&to).unwrap_or(0);
+        env.storage().instance().set(&to, &(bal + amount));
+    }
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let from_bal: i128 = env.storage().instance().get(&from).unwrap_or(0);
+        let to_bal: i128 = env.storage().instance().get(&to).unwrap_or(0);
+        env.storage().instance().set(&from, &(from_bal - amount));
+        env.storage().instance().set(&to, &(to_bal + amount));
+    }
+    pub fn balance(env: Env, addr: Address) -> i128 {
+        env.storage().instance().get(&addr).unwrap_or(0)
+    }
+}
+
+#[contractclient(name = "TokenMockClient")]
+pub trait TokenMockInterface {
+    fn mint(env: Env, to: Address, amount: i128);
+    fn transfer(env: Env, from: Address, to: Address, amount: i128);
+    fn balance(env: Env, addr: Address) -> i128;
+}
+
+#[test]
+fn test_terminate_lease_bounty_paid() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+
+    // Deploy the token mock and fund the fee recipient.
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    let platform_fee: i128 = 1_000;
+    token_client.mint(&fee_recipient, &platform_fee);
+
+    // Configure admin and platform fee.
+    client.set_admin(&admin);
+    client.set_platform_fee(&admin, &platform_fee, &token_id, &fee_recipient);
+
+    // Seed a terminated, settled lease.
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Settled;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Bounty = 10 % of 1_000 = 100
+    let expected_bounty: i128 = 100;
+    assert_eq!(token_client.balance(&landlord), expected_bounty);
+    assert_eq!(token_client.balance(&fee_recipient), platform_fee - expected_bounty);
+
+    // Lease record must be removed from active storage.
+    assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
+}
+
+#[test]
+fn test_terminate_lease_no_bounty_without_platform_fee() {
+    // When no platform fee is configured, terminate_lease still succeeds
+    // and no token transfer occurs.
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Settled;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Should succeed without panicking even though no fee is set.
+    client.terminate_lease(&LEASE_ID, &landlord);
+    assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
+}

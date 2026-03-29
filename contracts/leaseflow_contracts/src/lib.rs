@@ -224,6 +224,13 @@ pub struct LeaseTerminated {
 }
 
 #[contractevent]
+pub struct TerminateBountyPaid {
+    pub lease_id: u64,
+    pub caller: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
 pub struct MaintenanceIssueReported {
     pub lease_id: u64,
     pub tenant: Address,
@@ -376,6 +383,14 @@ mod nft_contract {
     #[contractclient(name = "NftClient")]
     pub trait NftInterface {
         fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
+    }
+}
+
+mod token_contract {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "TokenClient")]
+    pub trait TokenInterface {
+        fn transfer(env: Env, from: Address, to: Address, amount: i128);
     }
 }
 
@@ -973,6 +988,22 @@ impl LeaseContract {
             return Err(LeaseError::DepositNotSettled);
         }
 
+        // [ISSUE 5] Pay a 10 % bounty of the platform fee to the caller to
+        // incentivise timely lease closure and prevent zombie storage.
+        const BOUNTY_BPS: i128 = 1_000; // 10 %
+        if let (Some(fee_amount), Some(fee_token), Some(fee_recipient)) = (
+            env.storage().instance().get::<DataKey, i128>(&DataKey::PlatformFeeAmount),
+            env.storage().instance().get::<DataKey, Address>(&DataKey::PlatformFeeToken),
+            env.storage().instance().get::<DataKey, Address>(&DataKey::PlatformFeeRecipient),
+        ) {
+            let bounty = fee_amount * BOUNTY_BPS / 10_000;
+            if bounty > 0 {
+                let token = token_contract::TokenClient::new(&env, &fee_token);
+                token.transfer(&fee_recipient, &caller, &bounty);
+                TerminateBountyPaid { lease_id, caller: caller.clone(), amount: bounty }.publish(&env);
+            }
+        }
+
         archive_lease(&env, lease_id, lease, caller);
         LeaseTerminated { lease_id }.publish(&env);
         Ok(())
@@ -1171,6 +1202,32 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
+    }
+
+    /// [ISSUE 5] Configure the platform fee used to fund terminate bounties.
+    /// Only callable by the admin. `fee_amount` is the total platform fee in
+    /// token stroops; 10 % of it is paid as a bounty to whoever calls
+    /// `terminate_lease`.
+    pub fn set_platform_fee(
+        env: Env,
+        admin: Address,
+        fee_amount: i128,
+        fee_token: Address,
+        fee_recipient: Address,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::PlatformFeeAmount, &fee_amount);
+        env.storage().instance().set(&DataKey::PlatformFeeToken, &fee_token);
+        env.storage().instance().set(&DataKey::PlatformFeeRecipient, &fee_recipient);
         Ok(())
     }
 
