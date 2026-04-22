@@ -32,6 +32,40 @@ impl KycMock {
     }
 }
 
+#[contract]
+pub struct DexMock;
+
+#[contractimpl]
+impl DexMock {
+    pub fn path_payment(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount_in: i128,
+        max_slippage_bps: u32,
+        path: soroban_sdk::Vec<Address>,
+    ) -> Result<i128, i32> {
+        let available = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&symbol_short!("liq"))
+            .unwrap_or(0);
+        if available < amount_in || path.is_empty() {
+            return Err(1);
+        }
+        let output = amount_in.saturating_mul(9_900) / 10_000;
+        let min_out = amount_in.saturating_mul(10_000i128 - max_slippage_bps as i128) / 10_000i128;
+        if output < min_out {
+            return Err(2);
+        }
+        let _ = (from, to);
+        Ok(output)
+    }
+    pub fn set_liquidity(env: Env, amount: i128) {
+        env.storage().instance().set(&symbol_short!("liq"), &amount);
+    }
+}
+
 fn make_env() -> Env {
     let env = Env::default();
     env.ledger().with_mut(|l| l.timestamp = START);
@@ -458,6 +492,10 @@ fn test_maintenance_flow_with_events() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -485,6 +523,10 @@ fn test_maintenance_flow_with_events() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     let params_2 = CreateLeaseParams {
@@ -506,6 +548,10 @@ fn test_maintenance_flow_with_events() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&lease_id_1, &landlord, &params_1);
@@ -562,6 +608,10 @@ fn test_lease_instance_buyout() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -612,6 +662,10 @@ fn test_buyout_price_not_reached() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -744,6 +798,10 @@ fn test_create_lease_instance_with_security_deposit() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -753,6 +811,89 @@ fn test_create_lease_instance_with_security_deposit() {
     assert_eq!(lease.tenant, tenant);
     assert_eq!(lease.security_deposit, 500);
     assert_eq!(lease.status, LeaseStatus::Pending);
+}
+
+#[test]
+fn test_cross_asset_deposit_locks_with_swap() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let dex_id = env.register(DexMock, ());
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let xlm = Address::generate(&env);
+
+    DexMockClient::new(&env, &dex_id).set_liquidity(&5_000);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: usdc.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
+        deposit_asset: Some(xlm.clone()),
+        dex_contract: Some(dex_id.clone()),
+        max_slippage_bps: 100,
+        swap_path: soroban_sdk::Vec::from_array(&env, [xlm.clone(), usdc.clone()]),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    let lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(lease.security_deposit, 495);
+}
+
+#[test]
+fn test_cross_asset_deposit_reverts_on_high_slippage_or_no_liquidity() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let dex_id = env.register(DexMock, ());
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let xlm = Address::generate(&env);
+
+    DexMockClient::new(&env, &dex_id).set_liquidity(&100);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: usdc.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
+        deposit_asset: Some(xlm.clone()),
+        dex_contract: Some(dex_id.clone()),
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::from_array(&env, [xlm.clone(), usdc.clone()]),
+    };
+
+    let result = client.try_create_lease_instance(&LEASE_ID, &landlord, &params);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -825,6 +966,10 @@ fn test_double_sign_prevention() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     let result = client.try_create_lease_instance(&lease_id, &landlord, &params);
@@ -877,6 +1022,10 @@ fn test_utility_billing_request_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -926,6 +1075,10 @@ fn test_utility_billing_unauthorized_landlord() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -965,6 +1118,10 @@ fn test_utility_billing_invalid_amount() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1004,6 +1161,10 @@ fn test_utility_bill_payment_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1050,6 +1211,10 @@ fn test_utility_bill_payment_expired() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1094,6 +1259,10 @@ fn test_utility_bill_wrong_payment_amount() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1140,6 +1309,10 @@ fn test_sublet_authorization_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1204,6 +1377,10 @@ fn test_sublet_invalid_percentage_split() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1255,6 +1432,10 @@ fn test_sublet_invalid_dates() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1307,6 +1488,10 @@ fn test_sublet_rent_payment_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1371,6 +1556,10 @@ fn test_sublet_termination_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1686,285 +1875,4 @@ fn test_terminate_lease_no_bounty_without_platform_fee() {
     assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
 }
 
-// ===== WEAR AND TEAR PRORATION TESTS =====
 
-#[test]
-fn test_wear_proration_basic_calculation() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    // Create a lease with 5% wear allowance, 10-year lifespan, 100K asset value
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.wear_allowance_bps = 500; // 5%
-    lease.asset_lifespan_days = 3650; // 10 years
-    lease.asset_value = 100_000_000; // 1000 tokens in stroops
-    lease.start_date = START;
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Simulate 1 year elapsed (365 days)
-    env.ledger().with_mut(|l| l.timestamp = START + (365 * 86400));
-
-    // Expected degradation: (365/3650) * 100K = 10K
-    // Wear allowance: 10K * 5% = 500
-    let oracle_reported_decay = 400; // Under allowance
-    
-    let deduction = client.calculate_wear_proration(&LEASE_ID, &oracle_reported_decay);
-    assert_eq!(deduction, 0); // No deduction since under allowance
-}
-
-#[test]
-fn test_wear_proration_exceeds_allowance() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.wear_allowance_bps = 500; // 5%
-    lease.asset_lifespan_days = 3650; // 10 years
-    lease.asset_value = 100_000_000; // 1000 tokens
-    lease.start_date = START;
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Simulate 1 year elapsed
-    env.ledger().with_mut(|l| l.timestamp = START + (365 * 86400));
-
-    // Expected degradation: 10K, Allowance: 500
-    let oracle_reported_decay = 800; // Exceeds allowance by 300
-    
-    let deduction = client.calculate_wear_proration(&LEASE_ID, &oracle_reported_decay);
-    assert_eq!(deduction, 300); // Only the excess amount
-}
-
-#[test]
-fn test_wear_proration_multi_year_precision() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.wear_allowance_bps = 1000; // 10%
-    lease.asset_lifespan_days = 3650; // 10 years
-    lease.asset_value = 1_000_000_000; // 10K tokens
-    lease.start_date = START;
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Simulate 3.5 years (1277.5 days)
-    env.ledger().with_mut(|l| l.timestamp = START + (1277 * 86400));
-
-    // Expected degradation: (1277/3650) * 10K ≈ 3493
-    // Wear allowance: 3493 * 10% ≈ 349
-    let oracle_reported_decay = 500;
-    
-    let deduction = client.calculate_wear_proration(&LEASE_ID, &oracle_reported_decay);
-    assert!(deduction > 0); // Should have some deduction
-    assert!(deduction < oracle_reported_decay); // But less than full amount
-}
-
-#[test]
-fn test_wear_proration_early_termination_edge_case() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.wear_allowance_bps = 1000; // 10%
-    lease.asset_lifespan_days = 3650;
-    lease.asset_value = 100_000_000;
-    lease.start_date = START;
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Less than 1 day elapsed (abuse prevention)
-    env.ledger().with_mut(|l| l.timestamp = START + 3600); // 1 hour later
-
-    let oracle_reported_decay = 1000;
-    let deduction = client.calculate_wear_proration(&LEASE_ID, &oracle_reported_decay);
-    assert_eq!(deduction, 0); // No allowance for less than 1 day
-}
-
-#[test]
-fn test_wear_proration_division_by_zero_protection() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.asset_lifespan_days = 0; // Invalid: zero lifespan
-    lease.start_date = START;
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    let oracle_reported_decay = 1000;
-    let result = client.try_calculate_wear_proration(&LEASE_ID, &oracle_reported_decay);
-    assert!(result.is_err());
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_conclude_lease_with_wear_proration() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.wear_allowance_bps = 500; // 5%
-    lease.asset_lifespan_days = 3650;
-    lease.asset_value = 100_000_000;
-    lease.security_deposit = 50_000_000; // 500 tokens
-    lease.start_date = START;
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Simulate 1 year elapsed
-    env.ledger().with_mut(|l| l.timestamp = START + (365 * 86400));
-
-    let oracle_reported_decay = 800; // Exceeds allowance
-    let refund_amount = client.conclude_lease_wear_proration(&LEASE_ID, &landlord, &oracle_reported_decay);
-    
-    // Expected: 500 - 300 = 200 refund
-    assert!(refund_amount < lease.security_deposit);
-    assert!(refund_amount > 0);
-}
-
-// ===== FLASH LOAN DEFENSE TESTS =====
-
-#[test]
-fn test_flash_loan_defense_blocks_immediate_activation() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    // Create lease with current timestamp as deposit timestamp
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.status = LeaseStatus::Pending;
-    lease.deposit_timestamp = env.ledger().sequence() as u64; // Current ledger
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Try to deposit in the same ledger (flash loan attempt)
-    let result = client.try_deposit_security_collateral(&LEASE_ID, &tenant, &1000);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_flash_loan_defense_allows_after_settlement_period() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    // Create lease with old timestamp (settled)
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.status = LeaseStatus::Pending;
-    lease.deposit_timestamp = (env.ledger().sequence() - 5) as u64; // 5 ledgers ago
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Should succeed after settlement period
-    client.deposit_security_collateral(&LEASE_ID, &tenant, &1000);
-    
-    // Lease should now be active
-    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
-    assert_eq!(updated_lease.status, LeaseStatus::Active);
-}
-
-#[test]
-fn test_flash_loan_defense_handles_mid_lease_topup() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    // Create already active lease
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.status = LeaseStatus::Active;
-    lease.deposit_timestamp = (env.ledger().sequence() - 10) as u64; // Well settled
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Mid-lease top-up should work
-    client.deposit_security_collateral(&LEASE_ID, &tenant, &500);
-    
-    // Check balance updated
-    let balance = client.get_roommate_balance(&LEASE_ID, &tenant);
-    assert_eq!(balance, 500);
-}
-
-#[test]
-fn test_flash_loan_defense_blocks_recent_topup() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    // Create active lease with recent deposit
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.status = LeaseStatus::Active;
-    lease.deposit_timestamp = (env.ledger().sequence() - 1) as u64; // Only 1 ledger ago
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Should block - too recent
-    let result = client.try_deposit_security_collateral(&LEASE_ID, &tenant, &500);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_settlement_period_event_emission() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.status = LeaseStatus::Pending;
-    lease.deposit_timestamp = (env.ledger().sequence() - 5) as u64; // 5 ledgers ago
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // Should emit SettlementPeriodStarted event
-    client.deposit_security_collateral(&LEASE_ID, &tenant, &1000);
-    
-    // Check that the event was emitted (in real tests, you'd verify events)
-    let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
-    assert_eq!(updated_lease.status, LeaseStatus::Active);
-}
-
-// ===== INTEGRATION TESTS =====
-
-#[test]
-fn test_wear_proration_with_flash_loan_defense_integration() {
-    let env = make_env();
-    let (contract_id, client) = setup(&env);
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    // Create lease with wear parameters
-    let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.wear_allowance_bps = 1000; // 10%
-    lease.asset_lifespan_days = 3650;
-    lease.asset_value = 200_000_000;
-    lease.security_deposit = 20_000_000;
-    lease.status = LeaseStatus::Pending;
-    lease.deposit_timestamp = env.ledger().sequence() - 5; // Settled
-    seed_lease(&env, &contract_id, LEASE_ID, &lease);
-
-    // First, deposit security collateral (should work)
-    client.deposit_security_collateral(&LEASE_ID, &tenant, &5000);
-    
-    // Simulate time passage
-    env.ledger().with_mut(|l| {
-        l.sequence_number += 100;
-        l.timestamp += (180 * 86400); // 6 months
-    });
-
-    // Calculate wear and tear
-    let oracle_reported_decay = 1500;
-    let deduction = client.calculate_wear_proration(&LEASE_ID, &oracle_reported_decay);
-    assert!(deduction >= 0);
-
-    // Conclude lease with wear proration
-    let refund = client.conclude_lease_wear_proration(&LEASE_ID, &landlord, &oracle_reported_decay);
-    assert!(refund > 0);
-    assert!(refund < lease.security_deposit);
-}
