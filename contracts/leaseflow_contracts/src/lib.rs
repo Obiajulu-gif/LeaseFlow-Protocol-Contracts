@@ -24,6 +24,7 @@ pub enum DepositStatus {
     Held,
     Settled,
     Disputed,
+    InArbitration,
 }
 
 #[contracttype]
@@ -33,6 +34,7 @@ pub enum LeaseStatus {
     Active,
     Expired,
     Disputed,
+    InArbitration,
     Terminated,
 }
 
@@ -125,6 +127,8 @@ pub struct LeaseInstance {
     pub asset_lifespan_days: u64,
     pub asset_value: i128,
     pub deposit_timestamp: u64,
+    pub subleasing_allowed: bool,
+    pub master_lease_id: Option<u64>,
 }
 
 #[contracttype]
@@ -167,6 +171,55 @@ pub struct CreateLeaseParams {
     pub wear_allowance_bps: u32,
     pub asset_lifespan_days: u64,
     pub asset_value: i128,
+    pub subleasing_allowed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeCase {
+    pub lease_id: u64,
+    pub challenger: Address,
+    pub dispute_timestamp: u64,
+    pub dispute_bond: i128,
+    pub selected_jurors: soroban_sdk::Vec<Address>,
+    pub juror_votes: soroban_sdk::Vec<bool>,
+    pub verdict_deadline: u64,
+    pub is_resolved: bool,
+    pub resolution: Option<DepositReleasePartial>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Juror {
+    pub address: Address,
+    pub reputation: u32,
+    pub stake_amount: i128,
+    pub cases_participated: u32,
+    pub successful_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubEscrowVault {
+    pub master_lease_id: u64,
+    pub sub_lease_id: u64,
+    pub sub_lessee: Address,
+    pub deposit_amount: i128,
+    pub is_active: bool,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateSubleaseParams {
+    pub master_lease_id: u64,
+    pub sub_lessee: Address,
+    pub sub_rent_amount: i128,
+    pub sub_deposit_amount: i128,
+    pub sub_start_date: u64,
+    pub sub_end_date: u64,
+    pub property_uri: String,
+    pub payment_token: Address,
 }
 
 #[contracttype]
@@ -186,6 +239,11 @@ pub enum DataKey {
     PlatformFeeToken,
     PlatformFeeRecipient,
     TermsHash,
+    DisputeCase(u64),
+    Juror(Address),
+    JurorPool,
+    SubEscrowVault(u64),
+    SubLeaseCounter,
 }
 
 #[contracttype]
@@ -320,6 +378,50 @@ pub struct EvictionEligible {
     pub debt: i128,
 }
 
+#[contractevent]
+pub struct DisputeRaised {
+    pub lease_id: u64,
+    pub challenger: Address,
+    pub dispute_bond: i128,
+    pub selected_jurors: soroban_sdk::Vec<Address>,
+    pub verdict_deadline: u64,
+}
+
+#[contractevent]
+pub struct JurorSelected {
+    pub lease_id: u64,
+    pub juror: Address,
+}
+
+#[contractevent]
+pub struct JurorVerdict {
+    pub lease_id: u64,
+    pub juror: Address,
+    pub vote: bool,
+}
+
+#[contractevent]
+pub struct JurorSlashed {
+    pub juror: Address,
+    pub slash_amount: i128,
+    pub reason: String,
+}
+
+#[contractevent]
+pub struct SubleaseCreated {
+    pub master_lease_id: u64,
+    pub sub_lease_id: u64,
+    pub sub_lessee: Address,
+    pub sub_escrow_vault_id: u64,
+}
+
+#[contractevent]
+pub struct SubleaseTerminated {
+    pub master_lease_id: u64,
+    pub sub_lease_id: u64,
+    pub reason: String,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -342,6 +444,19 @@ pub enum LeaseError {
     InvalidProrationMath = 17,
     FlashLoanAttemptBlocked = 18,
     SettlementPeriodNotElapsed = 19,
+    DisputeWindowExpired = 20,
+    InsufficientDisputeBond = 21,
+    DisputeAlreadyActive = 22,
+    JurorNotFound = 23,
+    InsufficientJurorStake = 24,
+    JurorSelectionFailed = 25,
+    VerdictDeadlinePassed = 26,
+    InsufficientJurorVotes = 27,
+    SubleasingNotAllowed = 28,
+    SubleaseBoundaryExceeded = 29,
+    MasterLeaseNotFound = 30,
+    SubEscrowVaultNotFound = 31,
+    JurorReputationTooLow = 32,
 }
 
 macro_rules! require {
@@ -355,6 +470,18 @@ macro_rules! require {
 const DAY_IN_LEDGERS: u32 = 17280;
 const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
 const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
+
+// Dispute resolution constants
+const DISPUTE_WINDOW_HOURS: u64 = 48;
+const DISPUTE_WINDOW_LEDGERS: u64 = DISPUTE_WINDOW_HOURS * 720; // 720 ledgers per hour
+const JURY_SIZE: u32 = 3;
+const JURY_VOTE_THRESHOLD: u32 = 2; // 2-of-3 multi-sig
+const JUROR_VOTE_DEADLINE_HOURS: u64 = 72;
+const JUROR_VOTE_DEADLINE_LEDGERS: u64 = JUROR_VOTE_DEADLINE_HOURS * 720;
+const MIN_JUROR_REPUTATION: u32 = 100;
+const MIN_JUROR_STAKE: i128 = 1_000_000; // 0.001 XLM equivalent
+const DISPUTE_BOND_AMOUNT: i128 = 5_000_000; // 0.005 XLM equivalent
+const JUROR_SLASH_AMOUNT: i128 = 2_000_000; // 0.002 XLM equivalent
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -431,6 +558,106 @@ pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, caller: Add
         .persistent()
         .set(&DataKey::HistoricalLease(lease_id), &historical);
     delete_lease_instance(env, lease_id);
+}
+
+// Dispute resolution helper functions
+pub fn save_dispute_case(env: &Env, dispute_id: u64, dispute_case: &DisputeCase) {
+    let key = DataKey::DisputeCase(dispute_id);
+    env.storage().persistent().set(&key, dispute_case);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_dispute_case(env: &Env, dispute_id: u64) -> Option<DisputeCase> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputeCase(dispute_id))
+}
+
+pub fn save_juror(env: &Env, juror_address: &Address, juror: &Juror) {
+    let key = DataKey::Juror(juror_address.clone());
+    env.storage().persistent().set(&key, juror);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_juror(env: &Env, juror_address: &Address) -> Option<Juror> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Juror(juror_address.clone()))
+}
+
+pub fn get_juror_pool(env: &Env) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::JurorPool)
+        .unwrap_or(soroban_sdk::Vec::new(env))
+}
+
+pub fn save_juror_pool(env: &Env, pool: &soroban_sdk::Vec<Address>) {
+    env.storage().persistent().set(&DataKey::JurorPool, pool);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::JurorPool, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn save_sub_escrow_vault(env: &Env, vault_id: u64, vault: &SubEscrowVault) {
+    let key = DataKey::SubEscrowVault(vault_id);
+    env.storage().persistent().set(&key, vault);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_sub_escrow_vault(env: &Env, vault_id: u64) -> Option<SubEscrowVault> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubEscrowVault(vault_id))
+}
+
+pub fn get_next_sub_lease_id(env: &Env) -> u64 {
+    let counter: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SubLeaseCounter)
+        .unwrap_or(0);
+    let next_id = counter + 1;
+    env.storage().persistent().set(&DataKey::SubLeaseCounter, &next_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::SubLeaseCounter, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+    next_id
+}
+
+// Cryptographically secure random juror selection
+pub fn select_random_jurors(env: &Env, pool: &soroban_sdk::Vec<Address>, count: u32) -> soroban_sdk::Vec<Address> {
+    let mut selected = soroban_sdk::Vec::new(env);
+    let mut available_indices = soroban_sdk::Vec::new(env);
+    
+    // Create index pool
+    for i in 0..pool.len() {
+        available_indices.push_back(i);
+    }
+    
+    // Use ledger timestamp and sequence for entropy
+    let seed = env.ledger().timestamp() ^ env.ledger().sequence() as u64;
+    
+    for _ in 0..count {
+        if available_indices.is_empty() {
+            break;
+        }
+        
+        let random_index = (seed % available_indices.len() as u64) as u32;
+        let juror_index = available_indices.get(random_index as u32).unwrap();
+        selected.push_back(pool.get(juror_index).unwrap());
+        
+        // Remove selected index
+        available_indices.remove(random_index as u32);
+    }
+    
+    selected
 }
 
 mod nft_contract {
@@ -889,6 +1116,8 @@ impl LeaseContract {
             asset_lifespan_days: params.asset_lifespan_days,
             asset_value: params.asset_value,
             deposit_timestamp: env.ledger().timestamp(),
+            subleasing_allowed: params.subleasing_allowed,
+            master_lease_id: None,
         };
         save_lease_instance(&env, lease_id, &lease);
         LeaseSigned {
@@ -1598,6 +1827,609 @@ impl LeaseContract {
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
+    }
+
+    // DAO Arbitration Functions
+    
+    /// Register a juror in the DAO arbitration system
+    pub fn register_juror(
+        env: Env,
+        juror_address: Address,
+        stake_amount: i128,
+    ) -> Result<(), LeaseError> {
+        juror_address.require_auth();
+        
+        if stake_amount < MIN_JUROR_STAKE {
+            return Err(LeaseError::InsufficientJurorStake);
+        }
+        
+        let juror = Juror {
+            address: juror_address.clone(),
+            reputation: 100, // Starting reputation
+            stake_amount,
+            cases_participated: 0,
+            successful_votes: 0,
+        };
+        
+        save_juror(&env, &juror_address, &juror);
+        
+        // Add to juror pool
+        let mut pool = get_juror_pool(&env);
+        if !pool.contains(&juror_address) {
+            pool.push_back(juror_address);
+            save_juror_pool(&env, &pool);
+        }
+        
+        Ok(())
+    }
+    
+    /// Raise a lease dispute within 48 hours of termination
+    pub fn raise_lease_dispute(
+        env: Env,
+        lease_id: u64,
+        challenger: Address,
+        dispute_bond: i128,
+    ) -> Result<(), LeaseError> {
+        challenger.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Verify challenger is either landlord or tenant
+        if challenger != lease.landlord && challenger != lease.tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Check if dispute window is still open (48 hours from termination)
+        let current_ledger = env.ledger().sequence() as u64;
+        let termination_ledger = if lease.status == LeaseStatus::Terminated {
+            // Use a stored termination timestamp or calculate from end_date
+            lease.end_date / 5 // Approximate ledger sequence
+        } else {
+            return Err(LeaseError::DisputeWindowExpired);
+        };
+        
+        if current_ledger > termination_ledger + DISPUTE_WINDOW_LEDGERS {
+            return Err(LeaseError::DisputeWindowExpired);
+        }
+        
+        // Check minimum bond requirement
+        if dispute_bond < DISPUTE_BOND_AMOUNT {
+            return Err(LeaseError::InsufficientDisputeBond);
+        }
+        
+        // Check if dispute already exists
+        if lease.deposit_status == DepositStatus::InArbitration {
+            return Err(LeaseError::DisputeAlreadyActive);
+        }
+        
+        // Select 3 random jurors from the pool
+        let juror_pool = get_juror_pool(&env);
+        if juror_pool.len() < JURY_SIZE as u32 {
+            return Err(LeaseError::JurorSelectionFailed);
+        }
+        
+        let selected_jurors = select_random_jurors(&env, &juror_pool, JURY_SIZE);
+        
+        // Create dispute case
+        let dispute_case = DisputeCase {
+            lease_id,
+            challenger: challenger.clone(),
+            dispute_timestamp: env.ledger().timestamp(),
+            dispute_bond,
+            selected_jurors: selected_jurors.clone(),
+            juror_votes: soroban_sdk::Vec::new(&env),
+            verdict_deadline: env.ledger().timestamp() + JUROR_VOTE_DEADLINE_LEDGERS,
+            is_resolved: false,
+            resolution: None,
+        };
+        
+        // Update lease status
+        lease.status = LeaseStatus::InArbitration;
+        lease.deposit_status = DepositStatus::InArbitration;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Save dispute case
+        save_dispute_case(&env, lease_id, &dispute_case);
+        
+        // Emit events
+        DisputeRaised {
+            lease_id,
+            challenger: challenger.clone(),
+            dispute_bond,
+            selected_jurors: selected_jurors.clone(),
+            verdict_deadline: dispute_case.verdict_deadline,
+        }.publish(&env);
+        
+        for juror in selected_jurors.iter() {
+            JurorSelected {
+                lease_id,
+                juror,
+            }.publish(&env);
+        }
+        
+        Ok(())
+    }
+    
+    /// Submit a juror's verdict on a dispute case
+    pub fn submit_juror_verdict(
+        env: Env,
+        lease_id: u64,
+        juror: Address,
+        vote: bool, // true for tenant, false for landlord
+        signed_verdict: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        juror.require_auth();
+        
+        let mut dispute_case = load_dispute_case(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Verify juror is selected for this case
+        if !dispute_case.selected_jurors.contains(&juror) {
+            return Err(LeaseError::NotAnArbitrator);
+        }
+        
+        // Check if verdict deadline has passed
+        if env.ledger().timestamp() > dispute_case.verdict_deadline {
+            // Slash juror for not voting on time
+            let mut juror_data = load_juror(&env, &juror)
+                .ok_or(LeaseError::JurorNotFound)?;
+            juror_data.stake_amount -= JUROR_SLASH_AMOUNT;
+            save_juror(&env, &juror, &juror_data);
+            
+            JurorSlashed {
+                juror: juror.clone(),
+                slash_amount: JUROR_SLASH_AMOUNT,
+                reason: String::from_str(&env, "Missed verdict deadline"),
+            }.publish(&env);
+            
+            return Err(LeaseError::VerdictDeadlinePassed);
+        }
+        
+        // Check if juror has already voted
+        for (i, selected_juror) in dispute_case.selected_jurors.iter().enumerate() {
+            if selected_juror == juror {
+                if dispute_case.juror_votes.len() > i as u32 {
+                    return Err(LeaseError::Unauthorised); // Already voted
+                }
+                break;
+            }
+        }
+        
+        // Add juror vote
+        dispute_case.juror_votes.push_back(vote);
+        
+        // Update juror statistics
+        let mut juror_data = load_juror(&env, &juror)
+            .ok_or(LeaseError::JurorNotFound)?;
+        juror_data.cases_participated += 1;
+        save_juror(&env, &juror, &juror_data);
+        
+        // Emit verdict event
+        JurorVerdict {
+            lease_id,
+            juror: juror.clone(),
+            vote,
+        }.publish(&env);
+        
+        // Save updated dispute case
+        save_dispute_case(&env, lease_id, &dispute_case);
+        
+        // Check if we have enough votes to resolve
+        if dispute_case.juror_votes.len() >= JURY_VOTE_THRESHOLD {
+            Self::resolve_dispute_with_verdict(env.clone(), lease_id)?;
+        }
+        
+        Ok(())
+    }
+    
+    /// Resolve dispute based on juror verdicts
+    fn resolve_dispute_with_verdict(
+        env: Env,
+        lease_id: u64,
+    ) -> Result<(), LeaseError> {
+        let mut dispute_case = load_dispute_case(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Count votes (true = favor tenant, false = favor landlord)
+        let mut tenant_votes = 0;
+        let mut landlord_votes = 0;
+        
+        for vote in dispute_case.juror_votes.iter() {
+            if vote {
+                tenant_votes += 1;
+            } else {
+                landlord_votes += 1;
+            }
+        }
+        
+        // Determine verdict (2-of-3 threshold)
+        let tenant_wins = tenant_votes >= JURY_VOTE_THRESHOLD;
+        
+        // Calculate resolution
+        let resolution = if tenant_wins {
+            // Tenant wins - full refund
+            DepositReleasePartial {
+                tenant_amount: lease.security_deposit,
+                landlord_amount: 0,
+            }
+        } else {
+            // Landlord wins - landlord gets deposit
+            DepositReleasePartial {
+                tenant_amount: 0,
+                landlord_amount: lease.security_deposit,
+            }
+        };
+        
+        // Update juror statistics
+        for (i, juror_addr) in dispute_case.selected_jurors.iter().enumerate() {
+            if i < dispute_case.juror_votes.len() {
+                let juror_vote = dispute_case.juror_votes.get(i as u32).unwrap();
+                let mut juror_data = load_juror(&env, &juror_addr)
+                    .ok_or(LeaseError::JurorNotFound)?;
+                
+                // Update reputation based on vote alignment with majority
+                if (tenant_wins && juror_vote) || (!tenant_wins && !juror_vote) {
+                    juror_data.successful_votes += 1;
+                    juror_data.reputation += 10;
+                } else {
+                    juror_data.reputation = juror_data.reputation.saturating_sub(5);
+                }
+                
+                save_juror(&env, &juror_addr, &juror_data);
+            }
+        }
+        
+        // Update lease status
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        dispute_case.is_resolved = true;
+        dispute_case.resolution = Some(resolution.clone());
+        
+        // Save updated data
+        save_lease_instance(&env, lease_id, &lease);
+        save_dispute_case(&env, lease_id, &dispute_case);
+        
+        // Emit resolution event
+        DisputeResolved {
+            lease_id,
+            resolution,
+        }.publish(&env);
+        
+        Ok(())
+    }
+    
+    /// Handle timeout for juror voting
+    pub fn handle_juror_timeout(
+        env: Env,
+        lease_id: u64,
+    ) -> Result<(), LeaseError> {
+        let dispute_case = load_dispute_case(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if dispute_case.is_resolved {
+            return Ok(()); // Already resolved
+        }
+        
+        if env.ledger().timestamp() <= dispute_case.verdict_deadline {
+            return Err(LeaseError::VerdictDeadlinePassed); // Not yet timed out
+        }
+        
+        // Slash jurors who didn't vote
+        for (i, juror_addr) in dispute_case.selected_jurors.iter().enumerate() {
+            if i >= dispute_case.juror_votes.len() {
+                let mut juror_data = load_juror(&env, &juror_addr)
+                    .ok_or(LeaseError::JurorNotFound)?;
+                juror_data.stake_amount -= JUROR_SLASH_AMOUNT;
+                save_juror(&env, &juror_addr, &juror_data);
+                
+                JurorSlashed {
+                    juror: juror_addr.clone(),
+                    slash_amount: JUROR_SLASH_AMOUNT,
+                    reason: String::from_str(&env, "Failed to vote on time"),
+                }.publish(&env);
+            }
+        }
+        
+        // If insufficient votes, forfeit dispute bond to opposing party
+        if dispute_case.juror_votes.len() < JURY_VOTE_THRESHOLD {
+            let lease = load_lease_instance_by_id(&env, lease_id)
+                .ok_or(LeaseError::LeaseNotFound)?;
+            
+            let opposing_party = if dispute_case.challenger == lease.tenant {
+                lease.landlord
+            } else {
+                lease.tenant
+            };
+            
+            // Transfer dispute bond to opposing party (in a real implementation)
+            // This would involve token transfers
+            
+            // Reset lease to normal disputed state
+            let mut lease = load_lease_instance_by_id(&env, lease_id)
+                .ok_or(LeaseError::LeaseNotFound)?;
+            lease.status = LeaseStatus::Disputed;
+            lease.deposit_status = DepositStatus::Disputed;
+            save_lease_instance(&env, lease_id, &lease);
+        }
+        
+        Ok(())
+    }
+    
+    // Sub-Leasing Functions
+    
+    /// Create a sub-lease with hierarchical dependency
+    pub fn create_sublease(
+        env: Env,
+        master_lease_id: u64,
+        tenant: Address,
+        params: CreateSubleaseParams,
+    ) -> Result<u64, LeaseError> {
+        tenant.require_auth();
+        
+        // Verify master lease exists and allows subleasing
+        let master_lease = load_lease_instance_by_id(&env, master_lease_id)
+            .ok_or(LeaseError::MasterLeaseNotFound)?;
+        
+        if !master_lease.subleasing_allowed {
+            return Err(LeaseError::SubleasingNotAllowed);
+        }
+        
+        // Verify caller is the master lease tenant
+        if tenant != master_lease.tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Verify sublease duration doesn't exceed master lease duration
+        if params.sub_end_date > master_lease.end_date {
+            return Err(LeaseError::SubleaseBoundaryExceeded);
+        }
+        
+        if params.sub_start_date < master_lease.start_date {
+            return Err(LeaseError::SubleaseBoundaryExceeded);
+        }
+        
+        // Get next sub-lease ID
+        let sub_lease_id = get_next_sub_lease_id(&env);
+        
+        // Create sub-escrow vault
+        let vault_id = sub_lease_id; // Use same ID for simplicity
+        let sub_escrow_vault = SubEscrowVault {
+            master_lease_id,
+            sub_lease_id,
+            sub_lessee: params.sub_lessee.clone(),
+            deposit_amount: params.sub_deposit_amount,
+            is_active: true,
+            created_at: env.ledger().timestamp(),
+        };
+        
+        // Save sub-escrow vault
+        save_sub_escrow_vault(&env, vault_id, &sub_escrow_vault);
+        
+        // Create sub-lease instance
+        let sub_lease = LeaseInstance {
+            landlord: tenant, // Master tenant becomes sub-landlord
+            tenant: params.sub_lessee.clone(),
+            rent_amount: params.sub_rent_amount,
+            deposit_amount: params.sub_deposit_amount,
+            security_deposit: params.sub_deposit_amount,
+            start_date: params.sub_start_date,
+            end_date: params.sub_end_date,
+            rent_paid_through: 0,
+            deposit_status: DepositStatus::Held,
+            status: LeaseStatus::Pending,
+            property_uri: params.property_uri.clone(),
+            nft_contract: master_lease.nft_contract.clone(),
+            token_id: master_lease.token_id,
+            active: true,
+            debt: 0,
+            rent_paid: 0,
+            expiry_time: params.sub_end_date,
+            buyout_price: None,
+            cumulative_payments: 0,
+            rent_per_sec: 0,
+            grace_period_end: params.sub_end_date,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            withdrawal_address: None,
+            rent_withdrawn: 0,
+            arbitrators: soroban_sdk::Vec::new(&env),
+            maintenance_status: MaintenanceStatus::None,
+            withheld_rent: 0,
+            repair_proof_hash: None,
+            inspector: None,
+            wear_allowance_bps: master_lease.wear_allowance_bps,
+            asset_lifespan_days: master_lease.asset_lifespan_days,
+            asset_value: master_lease.asset_value,
+            deposit_timestamp: env.ledger().timestamp(),
+            subleasing_allowed: false, // Sub-leases cannot be sub-leased further
+            master_lease_id: Some(master_lease_id),
+        };
+        
+        // Save sub-lease
+        save_lease_instance(&env, sub_lease_id, &sub_lease);
+        
+        // Emit events
+        SubleaseCreated {
+            master_lease_id,
+            sub_lease_id,
+            sub_lessee: params.sub_lessee.clone(),
+            sub_escrow_vault_id: vault_id,
+        }.publish(&env);
+        
+        LeaseSigned {
+            lease_id: sub_lease_id,
+            property_hash: params.property_uri.clone(),
+        }.publish(&env);
+        
+        Ok(sub_lease_id)
+    }
+    
+    /// Handle master lease termination - cascade to all sub-leases
+    pub fn terminate_master_with_subleases(
+        env: Env,
+        master_lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        // First terminate the master lease using existing logic
+        Self::terminate_lease(env.clone(), master_lease_id, caller)?;
+        
+        // Find and terminate all sub-leases
+        Self::terminate_all_subleases(env.clone(), master_lease_id, String::from_str(&env, "Master lease terminated"))?;
+        
+        Ok(())
+    }
+    
+    /// Terminate all sub-leases for a given master lease
+    fn terminate_all_subleases(
+        env: Env,
+        master_lease_id: u64,
+        reason: String,
+    ) -> Result<(), LeaseError> {
+        // This is a simplified implementation
+        // In practice, you'd need to iterate through all leases and find sub-leases
+        // For now, we'll use a counter-based approach
+        
+        let mut sub_lease_id = 1;
+        let max_lease_id = 10000; // Reasonable upper bound
+        
+        while sub_lease_id <= max_lease_id {
+            if let Some(sub_lease) = load_lease_instance_by_id(&env, sub_lease_id) {
+                if let Some(current_master_id) = sub_lease.master_lease_id {
+                    if current_master_id == master_lease_id {
+                        // Terminate this sub-lease
+                        let mut terminated_sublease = sub_lease;
+                        terminated_sublease.status = LeaseStatus::Terminated;
+                        terminated_sublease.active = false;
+                        save_lease_instance(&env, sub_lease_id, &terminated_sublease);
+                        
+                        // Deactivate sub-escrow vault
+                        if let Some(mut vault) = load_sub_escrow_vault(&env, sub_lease_id) {
+                            vault.is_active = false;
+                            save_sub_escrow_vault(&env, sub_lease_id, &vault);
+                        }
+                        
+                        SubleaseTerminated {
+                            master_lease_id,
+                            sub_lease_id,
+                            reason: reason.clone(),
+                        }.publish(&env);
+                    }
+                }
+            }
+            sub_lease_id += 1;
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle sub-lease damage - slash sub-escrow first, then master deposit
+    pub fn handle_sublease_damage(
+        env: Env,
+        sub_lease_id: u64,
+        damage_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let sub_lease = load_lease_instance_by_id(&env, sub_lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let master_lease_id = sub_lease.master_lease_id
+            .ok_or(LeaseError::MasterLeaseNotFound)?;
+        
+        let mut sub_escrow_vault = load_sub_escrow_vault(&env, sub_lease_id)
+            .ok_or(LeaseError::SubEscrowVaultNotFound)?;
+        
+        if !sub_escrow_vault.is_active {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // First, try to cover damage from sub-escrow
+        let remaining_damage = if damage_amount <= sub_escrow_vault.deposit_amount {
+            sub_escrow_vault.deposit_amount -= damage_amount;
+            0 // Damage fully covered
+        } else {
+            let remaining = damage_amount - sub_escrow_vault.deposit_amount;
+            sub_escrow_vault.deposit_amount = 0;
+            remaining // Remaining damage to be covered by master lease
+        };
+        
+        // Save updated sub-escrow vault
+        save_sub_escrow_vault(&env, sub_lease_id, &sub_escrow_vault);
+        
+        // If there's remaining damage, charge against master lease deposit
+        if remaining_damage > 0 {
+            let mut master_lease = load_lease_instance_by_id(&env, master_lease_id)
+                .ok_or(LeaseError::MasterLeaseNotFound)?;
+            
+            // Ensure we don't exceed master deposit
+            let actual_damage = remaining_damage.min(master_lease.security_deposit);
+            master_lease.security_deposit -= actual_damage;
+            
+            save_lease_instance(&env, master_lease_id, &master_lease);
+        }
+        
+        Ok(())
+    }
+    
+    /// Get sub-lease hierarchy information
+    pub fn get_sublease_hierarchy(
+        env: Env,
+        lease_id: u64,
+    ) -> Result<(Option<u64>, soroban_sdk::Vec<u64>), LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let master_lease_id = lease.master_lease_id;
+        let mut sub_leases = soroban_sdk::Vec::new(&env);
+        
+        // Find all sub-leases of this lease (simplified implementation)
+        let mut potential_sub_id = 1;
+        let max_lease_id = 10000;
+        
+        while potential_sub_id <= max_lease_id {
+            if let Some(potential_sub) = load_lease_instance_by_id(&env, potential_sub_id) {
+                if let Some(potential_master_id) = potential_sub.master_lease_id {
+                    if potential_master_id == lease_id {
+                        sub_leases.push_back(potential_sub_id);
+                    }
+                }
+            }
+            potential_sub_id += 1;
+        }
+        
+        Ok((master_lease_id, sub_leases))
+    }
+    
+    /// Validate sub-lease boundaries recursively
+    pub fn validate_sublease_boundaries(
+        env: Env,
+        sub_lease_id: u64,
+    ) -> Result<bool, LeaseError> {
+        let sub_lease = load_lease_instance_by_id(&env, sub_lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let master_lease_id = sub_lease.master_lease_id
+            .ok_or(LeaseError::MasterLeaseNotFound)?;
+        
+        let master_lease = load_lease_instance_by_id(&env, master_lease_id)
+            .ok_or(LeaseError::MasterLeaseNotFound)?;
+        
+        // Check temporal boundaries
+        if sub_lease.start_date < master_lease.start_date ||
+           sub_lease.end_date > master_lease.end_date {
+            return Ok(false);
+        }
+        
+        // Recursively check master lease boundaries
+        if let Some(grand_master_id) = master_lease.master_lease_id {
+            Self::validate_sublease_boundaries(env, master_lease_id)?;
+        }
+        
+        Ok(true)
     }
 }
 
