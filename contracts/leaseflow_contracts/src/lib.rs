@@ -2066,7 +2066,7 @@ impl LeaseContract {
         
         // Update juror statistics
         for (i, juror_addr) in dispute_case.selected_jurors.iter().enumerate() {
-            if i < dispute_case.juror_votes.len() {
+            if i < dispute_case.juror_votes.len() as usize {
                 let juror_vote = dispute_case.juror_votes.get(i as u32).unwrap();
                 let mut juror_data = load_juror(&env, &juror_addr)
                     .ok_or(LeaseError::JurorNotFound)?;
@@ -2120,7 +2120,7 @@ impl LeaseContract {
         
         // Slash jurors who didn't vote
         for (i, juror_addr) in dispute_case.selected_jurors.iter().enumerate() {
-            if i >= dispute_case.juror_votes.len() {
+            if i >= dispute_case.juror_votes.len() as usize {
                 let mut juror_data = load_juror(&env, &juror_addr)
                     .ok_or(LeaseError::JurorNotFound)?;
                 juror_data.stake_amount -= JUROR_SLASH_AMOUNT;
