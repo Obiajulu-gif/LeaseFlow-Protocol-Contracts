@@ -121,6 +121,10 @@ pub struct LeaseInstance {
     pub withheld_rent: i128,
     pub repair_proof_hash: Option<BytesN<32>>,
     pub inspector: Option<Address>,
+    pub wear_allowance_bps: u32,
+    pub asset_lifespan_days: u64,
+    pub asset_value: i128,
+    pub deposit_timestamp: u64,
 }
 
 #[contracttype]
@@ -160,6 +164,9 @@ pub struct CreateLeaseParams {
     pub end_date: u64,
     pub property_uri: String,
     pub payment_token: Address,
+    pub wear_allowance_bps: u32,
+    pub asset_lifespan_days: u64,
+    pub asset_value: i128,
 }
 
 #[contracttype]
@@ -203,10 +210,23 @@ pub struct RentPaidPartial {
 }
 
 #[contractevent]
+pub struct PaymentLate {
+    pub lease_id: u64,
+    pub days_late: u64,
+    pub current_fine: i128,
+}
+
+#[contractevent]
 pub struct LeaseStarted {
     pub id: u64,
     pub renter: Address,
     pub rate: i128,
+}
+
+#[contractevent]
+pub struct LeaseSigned {
+    pub lease_id: u64,
+    pub property_hash: String,
 }
 
 #[contractevent]
@@ -278,6 +298,22 @@ pub struct DisputeResolved {
 }
 
 #[contractevent]
+pub struct WearAndTearCalculated {
+    pub lease_id: u64,
+    pub allowed_decay: i128,
+    pub reported_decay: i128,
+    pub elapsed_days: u64,
+    pub wear_allowance_bps: u32,
+}
+
+#[contractevent]
+pub struct SettlementPeriodStarted {
+    pub lease_id: u64,
+    pub deposit_timestamp: u64,
+    pub settlement_ledgers: u32,
+}
+
+#[contractevent]
 pub struct EvictionEligible {
     pub lease_id: u64,
     pub tenant: Address,
@@ -303,6 +339,9 @@ pub enum LeaseError {
     NotAnArbitrator = 14,
     LeaseAlreadyExists = 15,
     UpgradeNotAllowed = 16,
+    InvalidProrationMath = 17,
+    FlashLoanAttemptBlocked = 18,
+    SettlementPeriodNotElapsed = 19,
 }
 
 macro_rules! require {
@@ -824,7 +863,7 @@ impl LeaseContract {
             rent_paid_through: 0,
             deposit_status: DepositStatus::Held,
             status: LeaseStatus::Pending,
-            property_uri: params.property_uri,
+            property_uri: params.property_uri.clone(),
             nft_contract: None,
             token_id: None,
             active: true,
@@ -846,6 +885,10 @@ impl LeaseContract {
             withheld_rent: 0,
             repair_proof_hash: None,
             inspector: None,
+            wear_allowance_bps: params.wear_allowance_bps,
+            asset_lifespan_days: params.asset_lifespan_days,
+            asset_value: params.asset_value,
+            deposit_timestamp: env.ledger().timestamp(),
         };
         save_lease_instance(&env, lease_id, &lease);
         LeaseSigned {
@@ -857,7 +900,7 @@ impl LeaseContract {
     }
 
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
-        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound);
+        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
     }
 
     pub fn set_lease_instance_buyout_price(
@@ -1369,6 +1412,147 @@ impl LeaseContract {
             .persistent()
             .get(&DataKey::RoommateBalance(lease_id, roommate))
             .unwrap_or(0)
+    }
+
+    /// Calculate wear and tear proration for long-term leases
+    /// Uses i128 fixed-point math for precision without truncation
+    pub fn calculate_wear_proration(
+        env: Env,
+        lease_id: u64,
+        oracle_reported_decay: i128,
+    ) -> Result<i128, LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Prevent division by zero
+        if lease.asset_lifespan_days == 0 {
+            return Err(LeaseError::InvalidProrationMath);
+        }
+        
+        let current_time = env.ledger().timestamp();
+        let elapsed_seconds = current_time.saturating_sub(lease.start_date);
+        let elapsed_days = elapsed_seconds / 86_400; // Convert to days
+        
+        // Edge case: extremely early termination to prevent abuse
+        if elapsed_days < 1 {
+            return Ok(0); // No allowance for less than 1 day
+        }
+        
+        // Calculate expected degradation: (elapsed_lease_time / total_expected_lifespan) * asset_value
+        // Using i128 fixed-point math: multiply first, then divide to maintain precision
+        let expected_degradation = (elapsed_days as i128)
+            .saturating_mul(lease.asset_value)
+            .saturating_div(lease.asset_lifespan_days as i128);
+        
+        // Apply wear allowance: expected_degradation * wear_allowance_bps / 10000
+        let allowed_decay = expected_degradation
+            .saturating_mul(lease.wear_allowance_bps as i128)
+            .saturating_div(10_000_i128);
+        
+        // Round in favor of protocol (ceiling division)
+        let protocol_favor_decay = if expected_degradation.saturating_mul(lease.wear_allowance_bps as i128) % 10_000_i128 != 0 {
+            allowed_decay + 1
+        } else {
+            allowed_decay
+        };
+        
+        // Emit event with calculation details
+        WearAndTearCalculated {
+            lease_id,
+            allowed_decay: protocol_favor_decay,
+            reported_decay: oracle_reported_decay,
+            elapsed_days,
+            wear_allowance_bps: lease.wear_allowance_bps,
+        }
+        .publish(&env);
+        
+        // If Oracle reported damage falls under allowance, no penalty
+        if oracle_reported_decay <= protocol_favor_decay {
+            Ok(0) // No deduction
+        } else {
+            // Return the amount exceeding the allowance
+            Ok(oracle_reported_decay - protocol_favor_decay)
+        }
+    }
+
+    /// Deposit security collateral with flash loan protection
+    pub fn deposit_security_collateral(
+        env: Env,
+        lease_id: u64,
+        payer: Address,
+        amount: i128,
+    ) -> Result<(), LeaseError> {
+        payer.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Check if this is a potential flash loan attempt
+        let current_ledger = env.ledger().sequence() as u64;
+        let deposit_ledger = lease.deposit_timestamp;
+        
+        // Settlement period requirement: 3 ledgers
+        const SETTLEMENT_LEDGERS: u32 = 3;
+        
+        // Check if deposit was made in current or recent ledgers (potential flash loan)
+        if current_ledger.saturating_sub(deposit_ledger) < SETTLEMENT_LEDGERS as u64 {
+            // Log the attempt and block
+            // In a real implementation, you might want to store this in a blacklist
+            return Err(LeaseError::FlashLoanAttemptBlocked);
+        }
+        
+        // Update lease status to Active after settlement period
+        if lease.status == LeaseStatus::Pending {
+            lease.status = LeaseStatus::Active;
+            
+            SettlementPeriodStarted {
+                lease_id,
+                deposit_timestamp: lease.deposit_timestamp,
+                settlement_ledgers: SETTLEMENT_LEDGERS,
+            }
+            .publish(&env);
+        }
+        
+        // Handle mid-lease top-ups
+        let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
+        let mut current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        current_balance += amount;
+        env.storage().persistent().set(&balance_key, &current_balance);
+        env.storage()
+            .persistent()
+            .extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        save_lease_instance(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Enhanced conclude_lease with wear and tear integration
+    pub fn conclude_lease_wear_proration(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        oracle_reported_decay: i128,
+    ) -> Result<i128, LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if landlord != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
+        
+        // Calculate wear and tear proration
+        let wear_deduction = Self::calculate_wear_proration(env.clone(), lease_id, oracle_reported_decay)?;
+        
+        // Ensure deduction doesn't exceed deposit
+        let total_deduction = if wear_deduction > lease.security_deposit {
+            lease.security_deposit
+        } else {
+            wear_deduction
+        };
+        
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        Ok(lease.security_deposit - total_deduction)
     }
 
     pub fn set_terms_hash(env: Env, admin: Address, hash: BytesN<32>) -> Result<(), LeaseError> {
