@@ -233,6 +233,10 @@ pub enum DataKey {
     WhitelistedOracle(BytesN<32>),
     OracleNonce(BytesN<32>, u64),
     TenantFlag(u64),
+    YieldDeployment(u64),
+    WhitelistedYieldProtocol(Address),
+    LiquidityBuffer,
+    YieldAccumulated(u64),
 }
 
 #[contracttype]
@@ -241,6 +245,25 @@ pub struct HistoricalLease {
     pub lease: LeaseInstance,
     pub terminated_by: Address,
     pub terminated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldDeployment {
+    pub lease_id: u64,
+    pub principal_amount: i128,
+    pub yield_protocol: Address,
+    pub deployment_timestamp: u64,
+    pub lp_tokens: i128,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldDistribution {
+    pub lessee_bps: u32,
+    pub lessor_bps: u32,
+    pub dao_bps: u32,
 }
 
 #[contractevent]
@@ -387,6 +410,17 @@ pub struct TenantFlagged {
     pub reason: String,
 }
 
+#[contractevent]
+pub struct EscrowYieldHarvested {
+    pub lease_id: u64,
+    pub total_yield: i128,
+    pub lessee_share: i128,
+    pub lessor_share: i128,
+    pub dao_share: i128,
+    pub yield_protocol: Address,
+    pub harvest_timestamp: u64,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -414,6 +448,10 @@ pub enum LeaseError {
     InvalidNonce = 22,
     LeaseNotTerminated = 23,
     DepositAlreadySettled = 24,
+    YieldUnderflow = 25,
+    InsufficientLiquidityBuffer = 26,
+    YieldProtocolNotWhitelisted = 27,
+    InvalidYieldDistribution = 28,
 }
 
 macro_rules! require {
@@ -541,6 +579,17 @@ mod dex_contract {
             max_slippage_bps: u32,
             path: Vec<Address>,
         ) -> Result<i128, i32>;
+    }
+}
+
+mod yield_protocol {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "YieldClient")]
+    pub trait YieldInterface {
+        fn deposit(env: Env, from: Address, amount: i128) -> Result<i128, i32>;
+        fn withdraw(env: Env, from: Address, lp_tokens: i128) -> Result<i128, i32>;
+        fn get_balance(env: Env, user: Address) -> i128;
+        fn claim_rewards(env: Env, user: Address) -> Result<i128, i32>;
     }
 }
 
@@ -1813,6 +1862,43 @@ impl LeaseContract {
             .has(&DataKey::WhitelistedOracle(oracle_pubkey.clone()))
     }
 
+    fn is_yield_protocol_whitelisted(env: &Env, protocol: &Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::WhitelistedYieldProtocol(protocol.clone()))
+    }
+
+    fn get_liquidity_buffer(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LiquidityBuffer)
+            .unwrap_or(0)
+    }
+
+    fn set_liquidity_buffer(env: &Env, amount: i128) {
+        env.storage().instance().set(&DataKey::LiquidityBuffer, &amount);
+    }
+
+    fn calculate_yield_distribution(total_yield: i128) -> (i128, i128, i128) {
+        const LESSEE_BPS: u32 = 5000;
+        const LESSOR_BPS: u32 = 3000;
+        const DAO_BPS: u32 = 2000;
+        
+        let lessee_share = total_yield.saturating_mul(LESSEE_BPS as i128) / 10_000;
+        let lessor_share = total_yield.saturating_mul(LESSOR_BPS as i128) / 10_000;
+        let dao_share = total_yield.saturating_mul(DAO_BPS as i128) / 10_000;
+        
+        (lessee_share, lessor_share, dao_share)
+    }
+
+    fn verify_liquidity_buffer(env: &Env, required_amount: i128) -> Result<(), LeaseError> {
+        let current_buffer = Self::get_liquidity_buffer(env);
+        if current_buffer < required_amount {
+            return Err(LeaseError::InsufficientLiquidityBuffer);
+        }
+        Ok(())
+    }
+
     fn verify_ed25519_signature(
         env: &Env,
         pubkey: &BytesN<32>,
@@ -1976,6 +2062,246 @@ impl LeaseContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    pub fn whitelist_yield_protocol(
+        env: Env,
+        admin: Address,
+        protocol: Address,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistedYieldProtocol(protocol), &true);
+        Ok(())
+    }
+
+    pub fn set_liquidity_buffer_amount(
+        env: Env,
+        admin: Address,
+        buffer_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        Self::set_liquidity_buffer(&env, buffer_amount);
+        Ok(())
+    }
+
+    pub fn deploy_escrow_to_yield(
+        env: Env,
+        lease_id: u64,
+        yield_protocol: Address,
+        deploy_amount: i128,
+        max_slippage_bps: u32,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !Self::is_yield_protocol_whitelisted(&env, &yield_protocol) {
+            return Err(LeaseError::YieldProtocolNotWhitelisted);
+        }
+        
+        if lease.security_deposit < deploy_amount {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        Self::verify_liquidity_buffer(&env, deploy_amount)?;
+        
+        let yield_client = yield_protocol::YieldClient::new(&env, &yield_protocol);
+        let lp_tokens = yield_client
+            .deposit(
+                env.current_contract_address(),
+                deploy_amount,
+            )
+            .map_err(|_| LeaseError::PathPaymentFailed)?;
+        
+        if lp_tokens < deploy_amount.saturating_mul(10_000i128 - max_slippage_bps as i128) / 10_000i128 {
+            return Err(LeaseError::SlippageExceeded);
+        }
+        
+        let deployment = YieldDeployment {
+            lease_id,
+            principal_amount: deploy_amount,
+            yield_protocol: yield_protocol.clone(),
+            deployment_timestamp: env.ledger().timestamp(),
+            lp_tokens,
+            active: true,
+        };
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldDeployment(lease_id), &deployment);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::YieldDeployment(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        lease.security_deposit -= deploy_amount;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        let current_buffer = Self::get_liquidity_buffer(&env);
+        Self::set_liquidity_buffer(&env, current_buffer - deploy_amount);
+        
+        Ok(())
+    }
+
+    pub fn harvest_yield(
+        env: Env,
+        lease_id: u64,
+    ) -> Result<(), LeaseError> {
+        let deployment: YieldDeployment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldDeployment(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !deployment.active {
+            return Err(LeaseError::LeaseNotFound);
+        }
+        
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        let yield_client = yield_protocol::YieldClient::new(&env, &deployment.yield_protocol);
+        let total_yield = yield_client
+            .claim_rewards(env.current_contract_address())
+            .map_err(|_| LeaseError::PathPaymentFailed)?;
+        
+        if total_yield <= 0 {
+            return Err(LeaseError::YieldUnderflow);
+        }
+        
+        let (lessee_share, lessor_share, dao_share) = Self::calculate_yield_distribution(total_yield);
+        
+        let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+        
+        if lessee_share > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &lessee_share,
+            );
+        }
+        
+        if lessor_share > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &lessor_share,
+            );
+        }
+        
+        if dao_share > 0 {
+            if let Some(dao_address) = env.storage().instance().get(&DataKey::PlatformFeeRecipient) {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &dao_address,
+                    &dao_share,
+                );
+            }
+        }
+        
+        let accumulated_yield: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldAccumulated(lease_id))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldAccumulated(lease_id), &(accumulated_yield + total_yield));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::YieldAccumulated(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        EscrowYieldHarvested {
+            lease_id,
+            total_yield,
+            lessee_share,
+            lessor_share,
+            dao_share,
+            yield_protocol: deployment.yield_protocol.clone(),
+            harvest_timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        
+        Ok(())
+    }
+
+    pub fn withdraw_from_yield(
+        env: Env,
+        lease_id: u64,
+        max_slippage_bps: u32,
+    ) -> Result<(), LeaseError> {
+        let deployment: YieldDeployment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldDeployment(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if !deployment.active {
+            return Err(LeaseError::LeaseNotFound);
+        }
+        
+        let yield_client = yield_protocol::YieldClient::new(&env, &deployment.yield_protocol);
+        let withdrawn_amount = yield_client
+            .withdraw(
+                env.current_contract_address(),
+                deployment.lp_tokens,
+            )
+            .map_err(|_| LeaseError::PathPaymentFailed)?;
+        
+        if withdrawn_amount < deployment.principal_amount {
+            return Err(LeaseError::YieldUnderflow);
+        }
+        
+        let min_expected = deployment.principal_amount.saturating_mul(10_000i128 - max_slippage_bps as i128) / 10_000i128;
+        if withdrawn_amount < min_expected {
+            return Err(LeaseError::SlippageExceeded);
+        }
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        lease.security_deposit += withdrawn_amount;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        let mut updated_deployment = deployment.clone();
+        updated_deployment.active = false;
+        updated_deployment.lp_tokens = 0;
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldDeployment(lease_id), &updated_deployment);
+        
+        let current_buffer = Self::get_liquidity_buffer(&env);
+        Self::set_liquidity_buffer(&env, current_buffer + withdrawn_amount);
+        
+        Ok(())
+    }
+
+    pub fn get_yield_deployment(env: Env, lease_id: u64) -> Result<YieldDeployment, LeaseError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldDeployment(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)
+    }
+
+    pub fn get_accumulated_yield(env: Env, lease_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldAccumulated(lease_id))
+            .unwrap_or(0)
     }
 }
 
