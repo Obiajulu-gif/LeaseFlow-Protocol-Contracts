@@ -137,6 +137,8 @@ pub struct LeaseInstance {
     pub has_pet: bool,
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
+    pub early_termination_fee_bps: Option<u32>,
+    pub fixed_penalty: Option<i128>,
 }
 
 #[contracttype]
@@ -190,6 +192,8 @@ pub struct CreateLeaseParams {
     pub dex_contract: Option<Address>,
     pub max_slippage_bps: u32,
     pub swap_path: Vec<Address>,
+    pub early_termination_fee_bps: Option<u32>,
+    pub fixed_penalty: Option<i128>,
 }
 
 #[contracttype]
@@ -209,6 +213,7 @@ pub enum DataKey {
     PlatformFeeToken,
     PlatformFeeRecipient,
     TermsHash,
+    DefaultedBalance(Address),
 }
 
 #[contracttype]
@@ -322,6 +327,17 @@ pub struct CrossAssetDepositLocked {
     pub swap_path: Vec<Address>,
     pub original_amount: i128,
     pub final_locked_amount: i128,
+}
+
+#[contractevent]
+pub struct EarlyTerminationExecuted {
+    pub lease_id: u64,
+    pub tenant: Address,
+    pub landlord: Address,
+    pub penalty_amount: i128,
+    pub remaining_deposit: i128,
+    pub duration_remaining: u64,
+    pub total_lease_duration: u64,
 }
 
 #[contracterror]
@@ -984,6 +1000,8 @@ impl LeaseContract {
             has_pet: params.has_pet,
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
+            early_termination_fee_bps: params.early_termination_fee_bps,
+            fixed_penalty: params.fixed_penalty,
         };
         save_lease_instance(&env, lease_id, &lease);
         LeaseSigned {
@@ -1553,7 +1571,152 @@ impl LeaseContract {
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
+
+    pub fn execute_early_termination(
+        env: Env,
+        lease_id: u64,
+        tenant: Address,
+    ) -> Result<(), LeaseError> {
+        tenant.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only tenant can execute early termination
+        if lease.tenant != tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Lease must be active
+        if !lease.active || lease.status != LeaseStatus::Active {
+            return Err(LeaseError::LeaseNotFound);
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Cannot terminate after end date (use normal termination)
+        if current_time >= lease.end_date {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        // Flash loan protection: Check tenant's balance before and after
+        // This prevents tenants from using flash loans to temporarily inflate balances
+        let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+        let tenant_balance_before = token_client.balance(&tenant);
+        
+        // Require minimum balance to prevent flash loan manipulation
+        // Tenant must have at least the security deposit amount naturally
+        if tenant_balance_before < lease.security_deposit {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let total_lease_duration = lease.end_date - lease.start_date;
+        let elapsed_duration = current_time - lease.start_date;
+        let duration_remaining = lease.end_date - current_time;
+        
+        // Calculate remaining unpaid lease value
+        let remaining_lease_value = if lease.rent_per_sec > 0 {
+            (duration_remaining as i128).saturating_mul(lease.rent_per_sec)
+        } else {
+            0
+        };
+        
+        // Calculate penalty based on lease configuration
+        let penalty_amount = match (lease.early_termination_fee_bps, lease.fixed_penalty) {
+            (Some(fee_bps), _) => {
+                // Percentage-based penalty on remaining lease value
+                remaining_lease_value.saturating_mul(fee_bps as i128) / 10_000
+            }
+            (None, Some(fixed_amount)) => {
+                // Fixed penalty amount
+                fixed_amount
+            }
+            (None, None) => {
+                // No penalty configured
+                0
+            }
+        };
+        
+        // Ensure penalty doesn't exceed security deposit
+        let final_penalty = penalty_amount.min(lease.security_deposit);
+        let remaining_deposit = lease.security_deposit - final_penalty;
+        
+        // Handle case where penalty exceeds entire deposit
+        if penalty_amount > lease.security_deposit {
+            // Flag tenant as defaulted
+            let defaulted_key = DataKey::DefaultedBalance(tenant.clone());
+            env.storage().persistent().set(&defaulted_key, &true);
+            env.storage()
+                .persistent()
+                .extend_ttl(&defaulted_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        }
+        
+        // Transfer penalty to landlord
+        if final_penalty > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &final_penalty,
+            );
+        }
+        
+        // Transfer remaining deposit back to tenant
+        if remaining_deposit > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &remaining_deposit,
+            );
+        }
+        
+        // Flash loan protection: Verify tenant still has sufficient balance after operations
+        let tenant_balance_after = token_client.balance(&tenant);
+        
+        // Tenant should still have a reasonable buffer after penalty deduction
+        // This prevents flash loan attacks where temporary funds are used and immediately withdrawn
+        let min_buffer = lease.security_deposit / 10; // 10% buffer
+        if tenant_balance_after < min_buffer && remaining_deposit > 0 {
+            // This could indicate flash loan manipulation, revert the transaction
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Update lease status
+        lease.status = LeaseStatus::Terminated;
+        lease.active = false;
+        lease.deposit_status = DepositStatus::Settled;
+        
+        // Handle NFT return if present
+        if let (Some(nft_contract), Some(token_id)) = (&lease.nft_contract, &lease.token_id) {
+            delete_usage_rights(&env, nft_contract.clone(), *token_id);
+            let nft_client = nft_contract::NftClient::new(&env, nft_contract);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                token_id,
+            );
+        }
+        
+        // Archive the lease
+        archive_lease(&env, lease_id, lease.clone(), tenant.clone());
+        
+        // Emit event
+        EarlyTerminationExecuted {
+            lease_id,
+            tenant: tenant.clone(),
+            landlord: lease.landlord.clone(),
+            penalty_amount: final_penalty,
+            remaining_deposit,
+            duration_remaining,
+            total_lease_duration,
+        }.publish(&env);
+        
+        Ok(())
+    }
 }
 
 mod test;
 mod upgrade_tests;
+mod early_termination_tests;

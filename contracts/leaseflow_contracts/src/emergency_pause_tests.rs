@@ -46,6 +46,12 @@ fn create_test_lease(env: &Env, client: &LeaseContractClient, admin: &Address, l
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, landlord, &params);
@@ -133,6 +139,12 @@ fn test_emergency_pause_rent_by_arbitrator() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -264,6 +276,8 @@ fn test_rent_calculation_with_pause() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
