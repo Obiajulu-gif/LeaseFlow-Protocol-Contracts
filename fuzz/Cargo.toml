@@ -24,3 +24,9 @@ path = "fuzz_targets/fuzz_deposit_split.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_abandoned_deposit"
+path = "fuzz_targets/fuzz_abandoned_deposit.rs"
+test = false
+doc = false
+
