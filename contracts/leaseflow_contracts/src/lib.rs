@@ -137,6 +137,7 @@ pub struct LeaseInstance {
     pub has_pet: bool,
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
+    pub last_tenant_interaction: u64,
 }
 
 #[contracttype]
@@ -324,6 +325,15 @@ pub struct CrossAssetDepositLocked {
     pub final_locked_amount: i128,
 }
 
+#[contractevent]
+pub struct DepositSeizedForAbandonment {
+    pub lease_id: u64,
+    pub landlord: Address,
+    pub tenant: Address,
+    pub deposit_amount: i128,
+    pub seizure_timestamp: u64,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -345,6 +355,7 @@ pub enum LeaseError {
     UpgradeNotAllowed = 16,
     PathPaymentFailed = 17,
     SlippageExceeded = 18,
+    AbandonmentChallenge = 19,
 }
 
 macro_rules! require {
@@ -984,6 +995,7 @@ impl LeaseContract {
             has_pet: params.has_pet,
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
+            last_tenant_interaction: env.ledger().timestamp(),
         };
         save_lease_instance(&env, lease_id, &lease);
         LeaseSigned {
@@ -991,6 +1003,16 @@ impl LeaseContract {
             property_hash: params.property_uri.clone(),
         }
         .publish(&env);
+        Ok(())
+    }
+
+    fn update_tenant_heartbeat(env: &Env, lease_id: u64, tenant: &Address) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.tenant != *tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        lease.last_tenant_interaction = env.ledger().timestamp();
+        save_lease_instance(env, lease_id, &lease);
         Ok(())
     }
 
@@ -1035,6 +1057,11 @@ impl LeaseContract {
             .unwrap_or(false);
         if !is_primary && !is_authorized {
             return Err(LeaseError::Unauthorised);
+        }
+
+        // Update tenant heartbeat if this is the tenant paying
+        if is_primary {
+            update_tenant_heartbeat(&env, lease_id, &payer)?;
         }
 
         let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
@@ -1233,6 +1260,10 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         tenant.require_auth();
+        
+        // Update tenant heartbeat
+        update_tenant_heartbeat(&env, lease_id, &tenant)?;
+        
         lease.maintenance_status = MaintenanceStatus::Reported;
         save_lease_instance(&env, lease_id, &lease);
         MaintenanceIssueReported { lease_id, tenant }.publish(&env);
@@ -1521,6 +1552,65 @@ impl LeaseContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::TermsHash, &hash);
         TermsHashUpdated { new_terms_hash: hash }.publish(&env);
+        Ok(())
+    }
+
+    pub fn claim_abandoned_deposit(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+    ) -> Result<(), LeaseError> {
+        landlord.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only landlord can claim abandoned deposit
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Lease must be in Expired status
+        if lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        let current_time = env.ledger().timestamp();
+        const ABANDONMENT_GRACE_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+        
+        // Check if lease has been expired for at least 30 days
+        if lease.end_date + ABANDONMENT_GRACE_PERIOD > current_time {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        // Check if tenant has any interaction within the 30-day window
+        let abandonment_deadline = lease.end_date + ABANDONMENT_GRACE_PERIOD;
+        if lease.last_tenant_interaction > abandonment_deadline {
+            return Err(LeaseError::AbandonmentChallenge);
+        }
+        
+        // All conditions met - seize the deposit
+        let deposit_amount = lease.security_deposit;
+        
+        // Update lease status and deposit status
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+        
+        save_lease_instance(&env, lease_id, &lease);
+        
+        // Emit event for public record
+        DepositSeizedForAbandonment {
+            lease_id,
+            landlord: lease.landlord.clone(),
+            tenant: lease.tenant.clone(),
+            deposit_amount,
+            seizure_timestamp: current_time,
+        }
+        .publish(&env);
+        
+        // Archive the lease to maintain ledger hygiene
+        archive_lease(&env, lease_id, lease, landlord);
+        
         Ok(())
     }
 
