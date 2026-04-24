@@ -2312,3 +2312,7 @@ mod upgrade_tests;
 pub mod escrow_vault;
 pub mod continuous_billing_module;
 pub mod escrow_freeze_tests;
+
+// Flash Crash Protection Modules - Issue #114
+pub mod collateral_health_monitor;
+pub mod collateral_health_tests;
