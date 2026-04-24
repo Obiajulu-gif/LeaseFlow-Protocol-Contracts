@@ -5,9 +5,7 @@ use soroban_sdk::Env;
 use soroban_sdk::Symbol;
 
 // Import the contract
-contractimport!(
-    file = "../target/wasm32-unknown-unknown/release/leaseflow_contracts.wasm"
-);
+contractimport!(file = "../target/wasm32-unknown-unknown/release/leaseflow_contracts.wasm");
 
 #[derive(arbitrary::Arbitrary, Debug)]
 struct FuzzInput {
@@ -65,7 +63,7 @@ libfuzzer_sys::fuzz_target!(|data: FuzzInput| {
     // Manually set lease status and interaction timestamp for testing
     let lease_id = 1u64;
     let mut lease = client.get_lease_instance(&lease_id).unwrap();
-    
+
     // Set lease status based on input
     lease.status = match data.lease_status {
         0 => leaseflow_contracts::LeaseStatus::Pending,
@@ -74,32 +72,43 @@ libfuzzer_sys::fuzz_target!(|data: FuzzInput| {
         3 => leaseflow_contracts::LeaseStatus::Disputed,
         _ => leaseflow_contracts::LeaseStatus::Terminated,
     };
-    
+
     lease.last_tenant_interaction = data.tenant_last_interaction;
-    
+
     // Update lease in storage (we need to do this manually since there's no direct function)
     // For fuzzing purposes, we'll simulate the storage update
-    
+
     // Set ledger timestamp
-    env.ledger().with_mut(|l| l.timestamp = data.current_timestamp);
+    env.ledger()
+        .with_mut(|l| l.timestamp = data.current_timestamp);
 
     // Determine caller
-    let caller = if data.caller_is_landlord { landlord.clone() } else { unauthorized.clone() };
+    let caller = if data.caller_is_landlord {
+        landlord.clone()
+    } else {
+        unauthorized.clone()
+    };
 
     // Attempt to claim abandoned deposit
     let result = client.try_claim_abandoned_deposit(&lease_id, &caller);
 
     // Verify invariants:
-    
+
     // 1. If caller is not landlord, should always fail with Unauthorised
     if !data.caller_is_landlord {
-        assert_eq!(result, Err(Ok(leaseflow_contracts::LeaseError::Unauthorised)));
+        assert_eq!(
+            result,
+            Err(Ok(leaseflow_contracts::LeaseError::Unauthorised))
+        );
         return;
     }
 
     // 2. If lease is not Expired, should fail with LeaseNotExpired
     if data.lease_status != 2 {
-        assert_eq!(result, Err(Ok(leaseflow_contracts::LeaseError::LeaseNotExpired)));
+        assert_eq!(
+            result,
+            Err(Ok(leaseflow_contracts::LeaseError::LeaseNotExpired))
+        );
         return;
     }
 
@@ -109,41 +118,57 @@ libfuzzer_sys::fuzz_target!(|data: FuzzInput| {
 
     // 4. If current timestamp is before grace period deadline, should fail
     if data.current_timestamp < grace_period_deadline {
-        assert_eq!(result, Err(Ok(leaseflow_contracts::LeaseError::LeaseNotExpired)));
+        assert_eq!(
+            result,
+            Err(Ok(leaseflow_contracts::LeaseError::LeaseNotExpired))
+        );
         return;
     }
 
     // 5. If tenant had interaction after grace period deadline, should fail with AbandonmentChallenge
     if data.tenant_last_interaction > grace_period_deadline {
-        assert_eq!(result, Err(Ok(leaseflow_contracts::LeaseError::AbandonmentChallenge)));
+        assert_eq!(
+            result,
+            Err(Ok(leaseflow_contracts::LeaseError::AbandonmentChallenge))
+        );
         return;
     }
 
     // 6. If all conditions are met, should succeed
-    if data.current_timestamp >= grace_period_deadline && data.tenant_last_interaction <= grace_period_deadline {
+    if data.current_timestamp >= grace_period_deadline
+        && data.tenant_last_interaction <= grace_period_deadline
+    {
         assert!(result.is_ok());
     }
 
     // Additional timestamp manipulation checks:
-    
+
     // Ensure the function cannot be exploited by timestamp manipulation
     // The grace period should be strictly enforced
-    
+
     // Edge case: exactly at grace period deadline
     if data.current_timestamp == grace_period_deadline {
         // Should fail because grace period hasn't passed yet
-        assert_eq!(result, Err(Ok(leaseflow_contracts::LeaseError::LeaseNotExpired)));
+        assert_eq!(
+            result,
+            Err(Ok(leaseflow_contracts::LeaseError::LeaseNotExpired))
+        );
     }
-    
+
     // Edge case: one second after grace period deadline
-    if data.current_timestamp == grace_period_deadline + 1 && data.tenant_last_interaction <= grace_period_deadline {
+    if data.current_timestamp == grace_period_deadline + 1
+        && data.tenant_last_interaction <= grace_period_deadline
+    {
         // Should succeed because grace period has passed
         assert!(result.is_ok());
     }
-    
+
     // Edge case: tenant interaction exactly at grace period deadline
     if data.tenant_last_interaction == grace_period_deadline {
         // Should fail because tenant interacted at the deadline
-        assert_eq!(result, Err(Ok(leaseflow_contracts::LeaseError::AbandonmentChallenge)));
+        assert_eq!(
+            result,
+            Err(Ok(leaseflow_contracts::LeaseError::AbandonmentChallenge))
+        );
     }
 });
