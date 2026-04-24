@@ -45,8 +45,8 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
-      - name: Install proptest
-        run: cargo install proptest
+      # - name: Install proptest
+      #   run: cargo install proptest
 
       - name: Check Formatting
         run: cargo fmt --check
