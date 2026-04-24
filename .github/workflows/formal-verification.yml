@@ -9,6 +9,14 @@ on:
     # Run formal verification daily at 2 AM UTC
     - cron: '0 2 * * *'
 
+# --- THE FIX: Explicitly grant the GITHUB_TOKEN the required access ---
+permissions:
+  contents: read
+  statuses: write
+  issues: write
+  pull-requests: write
+# ----------------------------------------------------------------------
+
 env:
   CARGO_TERM_COLOR: always
 

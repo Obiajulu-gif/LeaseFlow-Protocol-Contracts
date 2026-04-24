@@ -25,11 +25,31 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "arbitrators"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "deposit_amount"
                       },
                       "val": {
                         "i128": "1500"
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit_asset"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "dex_contract"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -41,10 +61,74 @@
                     },
                     {
                       "key": {
+                        "symbol": "equity_percentage_bps"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period_end"
+                      },
+                      "val": {
+                        "u64": "2592000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "has_pet"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "late_fee_flat"
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "late_fee_per_sec"
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "max_slippage_bps"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "payment_token"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pet_deposit_amount"
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pet_rent_amount"
+                      },
+                      "val": {
+                        "i128": "0"
                       }
                     },
                     {
@@ -65,6 +149,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "rent_per_sec"
+                      },
+                      "val": {
+                        "i128": "1"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "security_deposit"
                       },
                       "val": {
@@ -81,10 +173,26 @@
                     },
                     {
                       "key": {
+                        "symbol": "swap_path"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "tenant"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "yield_delegation_enabled"
+                      },
+                      "val": {
+                        "bool": false
                       }
                     }
                   ]
@@ -113,11 +221,31 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "arbitrators"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "deposit_amount"
                       },
                       "val": {
                         "i128": "1500"
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "deposit_asset"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "dex_contract"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {
@@ -129,10 +257,74 @@
                     },
                     {
                       "key": {
+                        "symbol": "equity_percentage_bps"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "grace_period_end"
+                      },
+                      "val": {
+                        "u64": "2592000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "has_pet"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "late_fee_flat"
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "late_fee_per_sec"
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "max_slippage_bps"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "payment_token"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pet_deposit_amount"
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "pet_rent_amount"
+                      },
+                      "val": {
+                        "i128": "0"
                       }
                     },
                     {
@@ -153,6 +345,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "rent_per_sec"
+                      },
+                      "val": {
+                        "i128": "1"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "security_deposit"
                       },
                       "val": {
@@ -169,10 +369,26 @@
                     },
                     {
                       "key": {
+                        "symbol": "swap_path"
+                      },
+                      "val": {
+                        "vec": []
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "tenant"
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "yield_delegation_enabled"
+                      },
+                      "val": {
+                        "bool": false
                       }
                     }
                   ]
@@ -235,6 +451,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "billing_cycle_duration"
+                    },
+                    "val": {
+                      "u64": "2592000"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "buyout_price"
                     },
                     "val": "void"
@@ -285,6 +509,22 @@
                   },
                   {
                     "key": {
+                      "symbol": "equity_balance"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "equity_percentage_bps"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "expiry_time"
                     },
                     "val": {
@@ -309,6 +549,22 @@
                   },
                   {
                     "key": {
+                      "symbol": "had_late_payment"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "has_pet"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "inspector"
                     },
                     "val": "void"
@@ -320,6 +576,12 @@
                     "val": {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "last_rent_pull_timestamp"
+                    },
+                    "val": "void"
                   },
                   {
                     "key": {
@@ -354,6 +616,56 @@
                       "symbol": "nft_contract"
                     },
                     "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "pause_initiator"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "pause_reason"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "paused"
+                    },
+                    "val": {
+                      "bool": false
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "paused_at"
+                    },
+                    "val": "void"
+                  },
+                  {
+                    "key": {
+                      "symbol": "payment_token"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pet_deposit_amount"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "pet_rent_amount"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
                   },
                   {
                     "key": {
@@ -392,8 +704,14 @@
                       "symbol": "rent_per_sec"
                     },
                     "val": {
-                      "i128": "0"
+                      "i128": "1"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "rent_pull_authorized_amount"
+                    },
+                    "val": "void"
                   },
                   {
                     "key": {
@@ -461,6 +779,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "total_paused_duration"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "withdrawal_address"
                     },
                     "val": "void"
@@ -471,6 +797,22 @@
                     },
                     "val": {
                       "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "yield_accumulated"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "yield_delegation_enabled"
+                    },
+                    "val": {
+                      "bool": false
                     }
                   }
                 ]
