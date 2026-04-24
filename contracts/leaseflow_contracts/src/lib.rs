@@ -28,6 +28,12 @@ mod velocity_guard_tests;
 #[cfg(test)]
 mod derived_access_token_tests;
 
+#[cfg(test)]
+mod mock_rwa_registry;
+
+#[cfg(test)]
+mod rwa_registry_tests;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
@@ -237,6 +243,10 @@ pub struct LeaseInstance {
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
     pub payment_token: Address,
+    pub asset_registry_address: Option<Address>,
+    pub asset_id: Option<u128>,
+    pub asset_freeze_proof: Option<BytesN<32>>,
+    pub asset_ownership_verified: bool,
 }
 
 #[contracttype]
@@ -290,6 +300,8 @@ pub struct CreateLeaseParams {
     pub dex_contract: Option<Address>,
     pub max_slippage_bps: u32,
     pub swap_path: Vec<Address>,
+    pub asset_registry_address: Option<Address>,
+    pub asset_id: Option<u128>,
 }
 
 #[contracttype]
@@ -320,6 +332,10 @@ pub enum DataKey {
     OracleFailureTimestamp(BytesN<32>),
     AssetCondition(u64),
     OracleRateLimit(BytesN<32>, u64),
+    WhitelistedRegistry(Address),
+    RegistryVerification(Address),
+    FrozenAsset(u64, Address, u128), // lease_id, registry_address, asset_id
+    AssetFreezeProof(u64, Address, u128), // lease_id, registry_address, asset_id
 }
 
 #[contracttype]
@@ -536,6 +552,16 @@ pub struct AssetMetadataUpdated {
     pub previous_condition: AssetCondition,
 }
 
+#[contractevent]
+pub struct AssetOwnershipVerified {
+    pub lease_id: u64,
+    pub registry_address: Address,
+    pub asset_id: u128,
+    pub owner: Address,
+    pub freeze_proof: BytesN<32>,
+    pub verification_timestamp: u64,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -572,6 +598,12 @@ pub enum LeaseError {
     FallbackHierarchyNotConfigured = 31,
     DaoArbitrationNotEnabled = 32,
     OracleBypassAttempt = 33,
+    AssetNotOwned = 34,
+    AssetRegistryInvalid = 35,
+    AssetFreezeFailed = 36,
+    AssetThawFailed = 37,
+    RegistryCallFailed = 38,
+    AssetVerificationFailed = 39,
 }
 
 macro_rules! require {
@@ -717,11 +749,25 @@ mod yield_protocol {
 }
 
 mod asset_registry {
-    use soroban_sdk::{contractclient, Address, Env, String};
+    use soroban_sdk::{contractclient, Address, Env, String, BytesN};
     #[contractclient(name = "AssetRegistryClient")]
     pub trait AssetRegistryInterface {
         fn update_asset_metadata(env: Env, lease_id: u64, condition: String, metadata_uri: String);
         fn get_asset_condition(env: Env, lease_id: u64) -> String;
+        fn verify_ownership(env: Env, asset_id: u128, claimed_owner: Address) -> bool;
+        fn freeze_asset(env: Env, asset_id: u128, freezer: Address) -> Result<BytesN<32>, u32>;
+        fn thaw_asset(env: Env, asset_id: u128, freezer: Address, freeze_proof: BytesN<32>) -> Result<(), u32>;
+        fn is_asset_frozen(env: Env, asset_id: u128) -> bool;
+        fn get_registry_info(env: Env) -> Result<RegistryInfo, u32>;
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct RegistryInfo {
+        pub registry_id: BytesN<32>,
+        pub version: u32,
+        pub is_whitelisted: bool,
+        pub supported_standards: Vec<String>,
     }
 }
 
@@ -730,6 +776,12 @@ pub struct LeaseContract;
 
 #[contractimpl]
 impl LeaseContract {
+    pub fn initialize(env: Env, admin: Address) {
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &admin);
+    }
+
     fn require_stablecoin(env: &Env, token: &Address) -> Result<(), LeaseError> {
         if !Self::is_asset_allowed(env, token) {
             return Err(LeaseError::InvalidAsset);
@@ -1182,6 +1234,189 @@ impl LeaseContract {
         None
     }
 
+    fn verify_asset_ownership(
+        env: &Env,
+        lease_id: u64,
+        landlord: &Address,
+        registry_address: &Address,
+        asset_id: u128,
+    ) -> Result<BytesN<32>, LeaseError> {
+        // Security: Check if registry is whitelisted
+        if !Self::is_registry_whitelisted(env, registry_address) {
+            return Err(LeaseError::AssetRegistryInvalid);
+        }
+
+        // Initialize registry client
+        let registry_client = asset_registry::AssetRegistryClient::new(env, registry_address);
+
+        // Security: Verify registry is legitimate by checking its info
+        let registry_info = registry_client.get_registry_info()
+            .map_err(|_| LeaseError::AssetRegistryInvalid)?;
+        
+        if !registry_info.is_whitelisted {
+            return Err(LeaseError::AssetRegistryInvalid);
+        }
+
+        // Verify ownership through dynamic dispatch
+        let is_owner = registry_client.verify_ownership(asset_id, landlord.clone());
+        if !is_owner {
+            return Err(LeaseError::AssetNotOwned);
+        }
+
+        // Freeze the asset to prevent transfer during lease
+        let freeze_proof = registry_client.freeze_asset(asset_id, env.current_contract_address())
+            .map_err(|_| LeaseError::AssetFreezeFailed)?;
+
+        // Store freeze proof for later thawing
+        let freeze_key = DataKey::AssetFreezeProof(lease_id, registry_address.clone(), asset_id);
+        env.storage().persistent().set(&freeze_key, &freeze_proof);
+        env.storage()
+            .persistent()
+            .extend_ttl(&freeze_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        // Store frozen asset record
+        let frozen_key = DataKey::FrozenAsset(lease_id, registry_address.clone(), asset_id);
+        env.storage().persistent().set(&frozen_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&frozen_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
+        // Emit verification event
+        AssetOwnershipVerified {
+            lease_id,
+            registry_address: registry_address.clone(),
+            asset_id,
+            owner: landlord.clone(),
+            freeze_proof: freeze_proof.clone(),
+            verification_timestamp: env.ledger().timestamp(),
+        }
+        .publish(env);
+
+        Ok(freeze_proof)
+    }
+
+    fn thaw_asset(
+        env: &Env,
+        lease_id: u64,
+        registry_address: &Address,
+        asset_id: u128,
+    ) -> Result<(), LeaseError> {
+        // Check if asset is frozen
+        let frozen_key = DataKey::FrozenAsset(lease_id, registry_address.clone(), asset_id);
+        if !env.storage().persistent().has(&frozen_key) {
+            return Err(LeaseError::AssetThawFailed);
+        }
+
+        // Get freeze proof
+        let freeze_proof: BytesN<32> = env.storage()
+            .persistent()
+            .get(&DataKey::AssetFreezeProof(lease_id, registry_address.clone(), asset_id))
+            .ok_or(LeaseError::AssetThawFailed)?;
+
+        // Initialize registry client
+        let registry_client = asset_registry::AssetRegistryClient::new(env, registry_address);
+
+        // Thaw the asset
+        registry_client.thaw_asset(asset_id, env.current_contract_address(), freeze_proof)
+            .map_err(|_| LeaseError::AssetThawFailed)?;
+
+        // Clean up storage
+        env.storage().persistent().remove(&frozen_key);
+        env.storage().persistent()
+            .remove(&DataKey::AssetFreezeProof(lease_id, registry_address.clone(), asset_id));
+
+        Ok(())
+    }
+
+    fn is_registry_whitelisted(env: &Env, registry_address: &Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::WhitelistedRegistry(registry_address.clone()))
+    }
+
+    pub fn add_whitelisted_registry(
+        env: Env,
+        admin: Address,
+        registry_address: Address,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+
+        // Verify registry is legitimate before whitelisting
+        let registry_client = asset_registry::AssetRegistryClient::new(&env, &registry_address);
+        let registry_info = registry_client.get_registry_info()
+            .map_err(|_| LeaseError::AssetRegistryInvalid)?;
+        
+        if !registry_info.is_whitelisted {
+            return Err(LeaseError::AssetRegistryInvalid);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistedRegistry(registry_address), &true);
+        Ok(())
+    }
+
+    pub fn remove_whitelisted_registry(
+        env: Env,
+        admin: Address,
+        registry_address: Address,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage()
+            .instance()
+            .remove(&DataKey::WhitelistedRegistry(registry_address));
+        Ok(())
+    }
+
+    pub fn settle_deposit(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+        tenant_refund: i128,
+        landlord_payout: i128,
+        _dao_payout: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        // Only allow admin or parties to settle
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|admin| admin == caller)
+            .unwrap_or(false);
+        
+        if caller != lease.landlord && caller != lease.tenant && !is_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+
+        caller.require_auth();
+
+        // Update deposit status
+        lease.deposit_status = DepositStatus::Settled;
+        save_lease_instance(&env, lease_id, &lease);
+
+        Ok(())
+    }
+
     pub fn create_lease_instance(
         env: Env,
         lease_id: u64,
@@ -1197,6 +1432,16 @@ impl LeaseContract {
         }
         landlord.require_auth();
         params.tenant.require_auth();
+
+        // RWA Asset Verification - Required if registry address is provided
+        let (freeze_proof, ownership_verified) = if let (Some(registry_address), Some(asset_id)) = 
+            (&params.asset_registry_address, params.asset_id) {
+            let proof = Self::verify_asset_ownership(&env, lease_id, &landlord, registry_address, asset_id)?;
+            (Some(proof), true)
+        } else {
+            (None, false)
+        };
+
         let locked_amount = if let Some(deposit_asset) = params.deposit_asset.clone() {
             Self::execute_deposit_swap(
                 &env,
@@ -1262,6 +1507,10 @@ impl LeaseContract {
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
             payment_token: params.payment_token.clone(),
+            asset_registry_address: params.asset_registry_address.clone(),
+            asset_id: params.asset_id,
+            asset_freeze_proof: freeze_proof,
+            asset_ownership_verified: ownership_verified,
         };
         save_lease_instance(&env, lease_id, &lease);
 
@@ -1470,6 +1719,12 @@ impl LeaseContract {
             );
         }
 
+        // Thaw RWA assets if they were frozen
+        if let (Some(registry_address), Some(asset_id)) = 
+            (&lease.asset_registry_address, lease.asset_id) {
+            let _ = Self::thaw_asset(&env, lease_id, registry_address, asset_id);
+        }
+
         archive_lease(&env, lease_id, lease, caller);
         LeaseTerminated { lease_id }.publish(&env);
         Ok(())
@@ -1582,6 +1837,12 @@ impl LeaseContract {
 
         // Update portfolio size
         VelocityGuard::update_portfolio_size(&env, &lease.landlord, -1)?;
+
+        // Thaw RWA assets if they were frozen
+        if let (Some(registry_address), Some(asset_id)) = 
+            (&lease.asset_registry_address, lease.asset_id) {
+            let _ = Self::thaw_asset(&env, lease_id, registry_address, asset_id);
+        }
 
         // Archive lease
         archive_lease(&env, lease_id, lease, caller);
