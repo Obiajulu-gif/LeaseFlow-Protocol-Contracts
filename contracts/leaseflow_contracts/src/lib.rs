@@ -40,6 +40,7 @@ pub enum LeaseStatus {
     Expired,
     Disputed,
     Terminated,
+    DaoArbitration,
 }
 
 #[contracttype]
@@ -64,6 +65,14 @@ pub enum DamageSeverity {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OracleStatus {
+    Active,
+    Demoted,
+    Failed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OraclePayload {
     pub lease_id: u64,
     pub oracle_pubkey: BytesN<32>,
@@ -71,6 +80,34 @@ pub struct OraclePayload {
     pub nonce: u64,
     pub timestamp: u64,
     pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OracleTier {
+    Primary,
+    Backup,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleConfig {
+    pub pubkey: BytesN<32>,
+    pub tier: OracleTier,
+    pub status: OracleStatus,
+    pub last_successful_timestamp: u64,
+    pub demotion_timestamp: Option<u64>,
+    pub failure_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FallbackHierarchy {
+    pub primary_oracle: BytesN<32>,
+    pub backup_oracle: BytesN<32>,
+    pub dao_arbitration_enabled: bool,
+    pub hierarchy_active: bool,
+    pub last_demotion_time: Option<u64>,
 }
 
 #[contracttype]
@@ -244,10 +281,9 @@ pub enum DataKey {
     WhitelistedYieldProtocol(Address),
     LiquidityBuffer,
     YieldAccumulated(u64),
-    // Velocity Guard entries
-    VelocityTracker(Address),
-    PausedLessor(Address),
-    DaoApprovalRequest(u64),
+    OracleConfig(BytesN<32>),
+    FallbackHierarchy,
+    OracleFailureTimestamp(BytesN<32>),
 }
 
 #[contracttype]
@@ -432,6 +468,29 @@ pub struct EscrowYieldHarvested {
     pub harvest_timestamp: u64,
 }
 
+#[contractevent]
+pub struct OracleDemoted {
+    pub oracle_pubkey: BytesN<32>,
+    pub reason: String,
+    pub demotion_timestamp: u64,
+    pub failure_count: u32,
+}
+
+#[contractevent]
+pub struct FallbackHierarchyActivated {
+    pub primary_oracle: BytesN<32>,
+    pub backup_oracle: BytesN<32>,
+    pub activation_timestamp: u64,
+    pub reason: String,
+}
+
+#[contractevent]
+pub struct DaoArbitrationTriggered {
+    pub lease_id: u64,
+    pub trigger_timestamp: u64,
+    pub reason: String,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -463,7 +522,11 @@ pub enum LeaseError {
     InsufficientLiquidityBuffer = 26,
     YieldProtocolNotWhitelisted = 27,
     InvalidYieldDistribution = 28,
-    VelocityLimitExceeded = 29,
+    OracleStale = 29,
+    OracleUnavailable = 30,
+    FallbackHierarchyNotConfigured = 31,
+    DaoArbitrationNotEnabled = 32,
+    OracleBypassAttempt = 33,
 }
 
 macro_rules! require {
@@ -477,6 +540,9 @@ macro_rules! require {
 const DAY_IN_LEDGERS: u32 = 17280;
 const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
 const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
+const STALENESS_THRESHOLD: u64 = 48 * 60 * 60; // 48 hours in seconds
+const BACKUP_FAILURE_THRESHOLD: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
+const MAX_ORACLE_FAILURES: u32 = 3;
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -2008,6 +2074,153 @@ impl LeaseContract {
             .has(&DataKey::WhitelistedOracle(oracle_pubkey.clone()))
     }
 
+    fn get_oracle_config(env: &Env, oracle_pubkey: &BytesN<32>) -> Option<OracleConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OracleConfig(oracle_pubkey.clone()))
+    }
+
+    fn set_oracle_config(env: &Env, oracle_pubkey: &BytesN<32>, config: &OracleConfig) {
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleConfig(oracle_pubkey.clone()), config);
+    }
+
+    fn get_fallback_hierarchy(env: &Env) -> Option<FallbackHierarchy> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FallbackHierarchy)
+    }
+
+    fn set_fallback_hierarchy(env: &Env, hierarchy: &FallbackHierarchy) {
+        env.storage()
+            .instance()
+            .set(&DataKey::FallbackHierarchy, hierarchy);
+    }
+
+    fn staleness_check(env: &Env, payload_timestamp: u64) -> Result<bool, LeaseError> {
+        let current_time = env.ledger().timestamp();
+        
+        // Check if timestamp is from the future
+        if payload_timestamp > current_time {
+            return Err(LeaseError::OracleStale);
+        }
+        
+        // Check if timestamp is older than 48 hours
+        let age = current_time.saturating_sub(payload_timestamp);
+        if age > STALENESS_THRESHOLD {
+            return Err(LeaseError::OracleStale);
+        }
+        
+        Ok(true)
+    }
+
+    fn demote_oracle(
+        env: &Env, 
+        oracle_pubkey: &BytesN<32>, 
+        reason: String
+    ) -> Result<(), LeaseError> {
+        let mut config = Self::get_oracle_config(env, oracle_pubkey)
+            .ok_or(LeaseError::OracleNotWhitelisted)?;
+        
+        if config.status == OracleStatus::Demoted {
+            return Ok(()); // Already demoted
+        }
+        
+        config.status = OracleStatus::Demoted;
+        config.demotion_timestamp = Some(env.ledger().timestamp());
+        config.failure_count += 1;
+        
+        Self::set_oracle_config(env, oracle_pubkey, &config);
+        
+        OracleDemoted {
+            oracle_pubkey: oracle_pubkey.clone(),
+            reason,
+            demotion_timestamp: env.ledger().timestamp(),
+            failure_count: config.failure_count,
+        }
+        .publish(env);
+        
+        Ok(())
+    }
+
+    fn activate_fallback_hierarchy(
+        env: &Env,
+        reason: String
+    ) -> Result<(), LeaseError> {
+        let mut hierarchy = Self::get_fallback_hierarchy(env)
+            .ok_or(LeaseError::FallbackHierarchyNotConfigured)?;
+        
+        if hierarchy.hierarchy_active {
+            return Ok(()); // Already active
+        }
+        
+        hierarchy.hierarchy_active = true;
+        hierarchy.last_demotion_time = Some(env.ledger().timestamp());
+        
+        Self::set_fallback_hierarchy(env, &hierarchy);
+        
+        FallbackHierarchyActivated {
+            primary_oracle: hierarchy.primary_oracle.clone(),
+            backup_oracle: hierarchy.backup_oracle.clone(),
+            activation_timestamp: env.ledger().timestamp(),
+            reason,
+        }
+        .publish(env);
+        
+        Ok(())
+    }
+
+    fn trigger_dao_arbitration(
+        env: &Env,
+        lease_id: u64,
+        reason: String
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        lease.status = LeaseStatus::DaoArbitration;
+        save_lease_instance(env, lease_id, &lease);
+        
+        DaoArbitrationTriggered {
+            lease_id,
+            trigger_timestamp: env.ledger().timestamp(),
+            reason,
+        }
+        .publish(env);
+        
+        Ok(())
+    }
+
+    fn check_oracle_availability(
+        env: &Env,
+        oracle_pubkey: &BytesN<32>
+    ) -> Result<bool, LeaseError> {
+        let config = Self::get_oracle_config(env, oracle_pubkey)
+            .ok_or(LeaseError::OracleNotWhitelisted)?;
+        
+        match config.status {
+            OracleStatus::Active => Ok(true),
+            OracleStatus::Demoted => {
+                // Check if enough time has passed to allow retry
+                if let Some(demotion_time) = config.demotion_timestamp {
+                    let current_time = env.ledger().timestamp();
+                    let time_since_demotion = current_time.saturating_sub(demotion_time);
+                    
+                    // Allow retry after 24 hours if failure count is below threshold
+                    if time_since_demotion > 24 * 60 * 60 && config.failure_count < MAX_ORACLE_FAILURES {
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                } else {
+                    Ok(false)
+                }
+            },
+            OracleStatus::Failed => Ok(false),
+        }
+    }
+
     fn is_yield_protocol_whitelisted(env: &Env, protocol: &Address) -> bool {
         env.storage()
             .instance()
@@ -2122,27 +2335,76 @@ impl LeaseContract {
 
     pub fn execute_deposit_slash(env: Env, payload: OraclePayload) -> Result<(), LeaseError> {
         let current_time = env.ledger().timestamp();
-
-        let mut lease =
-            load_lease_instance_by_id(&env, payload.lease_id).ok_or(LeaseError::LeaseNotFound)?;
-
-        if lease.status != LeaseStatus::Terminated && lease.status != LeaseStatus::Expired {
-            return Err(LeaseError::LeaseNotTerminated);
+        
+        // First, check staleness
+        Self::staleness_check(&env, payload.timestamp)?;
+        
+        // Get fallback hierarchy configuration
+        let hierarchy = Self::get_fallback_hierarchy(&env);
+        
+        // Check if the oracle is whitelisted and available
+        let mut oracle_available = Self::is_oracle_whitelisted(&env, &payload.oracle_pubkey);
+        
+        if oracle_available {
+            oracle_available = Self::check_oracle_availability(&env, &payload.oracle_pubkey)?;
         }
-
-        if lease.deposit_status == DepositStatus::Settled {
-            return Err(LeaseError::DepositAlreadySettled);
-        }
-
-        if !Self::is_oracle_whitelisted(&env, &payload.oracle_pubkey) {
+        
+        // If primary oracle is not available, try fallback logic
+        if !oracle_available {
+            if let Some(hierarchy_config) = hierarchy {
+                // Check if this is the primary oracle that failed
+                if payload.oracle_pubkey == hierarchy_config.primary_oracle {
+                    // Demote primary oracle
+                    Self::demote_oracle(&env, &payload.oracle_pubkey, 
+                        String::from_str(&env, "Primary oracle stale or unavailable"))?;
+                    
+                    // Activate fallback hierarchy
+                    Self::activate_fallback_hierarchy(&env, 
+                        String::from_str(&env, "Primary oracle demoted due to staleness"))?;
+                    
+                    return Err(LeaseError::OracleStale);
+                }
+                // Check if this is the backup oracle that failed
+                else if payload.oracle_pubkey == hierarchy_config.backup_oracle {
+                    // Check if this is a prolonged backup failure (> 7 days)
+                    if let Some(last_demotion) = hierarchy_config.last_demotion_time {
+                        let time_since_demotion = current_time.saturating_sub(last_demotion);
+                        if time_since_demotion > BACKUP_FAILURE_THRESHOLD {
+                            // Trigger DAO arbitration for affected leases
+                            Self::trigger_dao_arbitration(&env, payload.lease_id,
+                                String::from_str(&env, "Backup oracle failed for 7+ days"))?;
+                            return Err(LeaseError::OracleUnavailable);
+                        }
+                    }
+                    
+                    // Demote backup oracle
+                    Self::demote_oracle(&env, &payload.oracle_pubkey,
+                        String::from_str(&env, "Backup oracle failed"))?;
+                    
+                    return Err(LeaseError::OracleUnavailable);
+                }
+            }
+            
             return Err(LeaseError::OracleNotWhitelisted);
         }
-
+        
+        // Security validation: prevent oracle bypass attempts
+        if let Some(hierarchy_config) = hierarchy {
+            if hierarchy_config.hierarchy_active {
+                // If hierarchy is active, only allow backup oracle
+                if payload.oracle_pubkey != hierarchy_config.backup_oracle {
+                    return Err(LeaseError::OracleBypassAttempt);
+                }
+            }
+        }
+        
+        // Standard oracle validation
         let stored_nonce = Self::get_oracle_nonce(&env, &payload.oracle_pubkey);
         if payload.nonce <= stored_nonce {
             return Err(LeaseError::InvalidNonce);
         }
 
+        // Additional timestamp validation (redundant with staleness_check but kept for security)
         if payload.timestamp > current_time || current_time - payload.timestamp > 86400 {
             return Err(LeaseError::InvalidSignature);
         }
@@ -2156,10 +2418,26 @@ impl LeaseContract {
             &payload.signature,
         );
 
+        // Update oracle success timestamp
+        if let Some(mut config) = Self::get_oracle_config(&env, &payload.oracle_pubkey) {
+            config.last_successful_timestamp = current_time;
+            if config.status == OracleStatus::Demoted && config.failure_count < MAX_ORACLE_FAILURES {
+                config.status = OracleStatus::Active; // Reinstate on success
+                config.failure_count = 0;
+                config.demotion_timestamp = None;
+            }
+            Self::set_oracle_config(&env, &payload.oracle_pubkey, &config);
+        }
+
         Self::set_oracle_nonce(&env, &payload.oracle_pubkey, payload.nonce);
 
         let mut lease = load_lease_instance_by_id(&env, payload.lease_id)
             .ok_or(LeaseError::LeaseNotFound)?;
+
+        // Check if lease is in DAO arbitration state
+        if lease.status == LeaseStatus::DaoArbitration {
+            return Err(LeaseError::DaoArbitrationNotEnabled);
+        }
 
         if lease.status != LeaseStatus::Terminated && lease.status != LeaseStatus::Expired {
             return Err(LeaseError::LeaseNotTerminated);
@@ -2254,10 +2532,12 @@ impl LeaseContract {
         Ok(())
     }
 
-    pub fn whitelist_yield_protocol(
+    pub fn set_fallback_hierarchy(
         env: Env,
         admin: Address,
-        protocol: Address,
+        primary_oracle: BytesN<32>,
+        backup_oracle: BytesN<32>,
+        dao_arbitration_enabled: bool,
     ) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
@@ -2268,10 +2548,94 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         admin.require_auth();
+        
+        // Validate both oracles are whitelisted
+        if !Self::is_oracle_whitelisted(&env, &primary_oracle) {
+            return Err(LeaseError::OracleNotWhitelisted);
+        }
+        if !Self::is_oracle_whitelisted(&env, &backup_oracle) {
+            return Err(LeaseError::OracleNotWhitelisted);
+        }
+        
+        // Ensure oracles are different
+        if primary_oracle == backup_oracle {
+            return Err(LeaseError::InvalidReleaseMath); // Reuse error for validation
+        }
+        
+        // Initialize oracle configurations
+        let primary_config = OracleConfig {
+            pubkey: primary_oracle.clone(),
+            tier: OracleTier::Primary,
+            status: OracleStatus::Active,
+            last_successful_timestamp: env.ledger().timestamp(),
+            demotion_timestamp: None,
+            failure_count: 0,
+        };
+        
+        let backup_config = OracleConfig {
+            pubkey: backup_oracle.clone(),
+            tier: OracleTier::Backup,
+            status: OracleStatus::Active,
+            last_successful_timestamp: env.ledger().timestamp(),
+            demotion_timestamp: None,
+            failure_count: 0,
+        };
+        
+        let hierarchy = FallbackHierarchy {
+            primary_oracle,
+            backup_oracle,
+            dao_arbitration_enabled,
+            hierarchy_active: false,
+            last_demotion_time: None,
+        };
+        
+        Self::set_oracle_config(&env, &primary_config.pubkey, &primary_config);
+        Self::set_oracle_config(&env, &backup_config.pubkey, &backup_config);
+        Self::set_fallback_hierarchy(&env, &hierarchy);
+        
+        Ok(())
+    }
 
-        env.storage()
+    pub fn get_oracle_status(
+        env: Env,
+        oracle_pubkey: BytesN<32>,
+    ) -> Result<OracleConfig, LeaseError> {
+        let config = Self::get_oracle_config(&env, &oracle_pubkey)
+            .ok_or(LeaseError::OracleNotWhitelisted)?;
+        Ok(config)
+    }
+
+    pub fn get_hierarchy_status(env: Env) -> Result<FallbackHierarchy, LeaseError> {
+        let hierarchy = Self::get_fallback_hierarchy(&env)
+            .ok_or(LeaseError::FallbackHierarchyNotConfigured)?;
+        Ok(hierarchy)
+    }
+
+    pub fn reset_oracle_status(
+        env: Env,
+        admin: Address,
+        oracle_pubkey: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
             .instance()
-            .set(&DataKey::WhitelistedYieldProtocol(protocol), &true);
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        let mut config = Self::get_oracle_config(&env, &oracle_pubkey)
+            .ok_or(LeaseError::OracleNotWhitelisted)?;
+        
+        config.status = OracleStatus::Active;
+        config.failure_count = 0;
+        config.demotion_timestamp = None;
+        config.last_successful_timestamp = env.ledger().timestamp();
+        
+        Self::set_oracle_config(&env, &oracle_pubkey, &config);
+        
         Ok(())
     }
 
@@ -2493,6 +2857,7 @@ impl LeaseContract {
 
 mod test;
 mod upgrade_tests;
+mod oracle_fallback_tests;
 
 // Global Escrow Freeze Circuit Breaker Modules
 pub mod escrow_vault;
