@@ -891,6 +891,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "leaseflow"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "leaseflow-fuzz"
 version = "0.0.0"
 dependencies = [
