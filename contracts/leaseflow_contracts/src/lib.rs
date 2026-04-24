@@ -10,6 +10,9 @@ use soroban_sdk::{
     BytesN, Env, String, Symbol, Vec,
 };
 
+mod velocity_guard;
+use velocity_guard::VelocityGuard;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
@@ -237,6 +240,10 @@ pub enum DataKey {
     WhitelistedYieldProtocol(Address),
     LiquidityBuffer,
     YieldAccumulated(u64),
+    // Velocity Guard entries
+    VelocityTracker(Address),
+    PausedLessor(Address),
+    DaoApprovalRequest(u64),
 }
 
 #[contracttype]
@@ -452,6 +459,7 @@ pub enum LeaseError {
     InsufficientLiquidityBuffer = 26,
     YieldProtocolNotWhitelisted = 27,
     InvalidYieldDistribution = 28,
+    VelocityLimitExceeded = 29,
 }
 
 macro_rules! require {
@@ -2307,3 +2315,8 @@ impl LeaseContract {
 
 mod test;
 mod upgrade_tests;
+
+// Global Escrow Freeze Circuit Breaker Modules
+pub mod escrow_vault;
+pub mod continuous_billing_module;
+pub mod escrow_freeze_tests;
