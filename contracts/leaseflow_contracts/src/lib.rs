@@ -13,6 +13,9 @@ use soroban_sdk::{
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
+mod continuous_billing_module;
+use continuous_billing_module::ContinuousBillingModule;
+
 #[cfg(test)]
 mod velocity_guard_tests;
 
@@ -194,6 +197,8 @@ pub struct LeaseInstance {
     pub rent_pull_authorized_amount: Option<i128>,
     pub last_rent_pull_timestamp: Option<u64>,
     pub billing_cycle_duration: u64,
+    pub continuous_billing_enabled: bool,
+    pub rent_treasury_address: Option<Address>,
     pub yield_delegation_enabled: bool,
     pub yield_accumulated: i128,
     pub equity_balance: i128,
@@ -1053,80 +1058,109 @@ impl LeaseContract {
         Ok(lease_id)
     }
 
-    pub fn create_lease_with_nft(
+    pub fn create_lease_with_continuous_billing(
         env: Env,
-        lease_id: Symbol,
         landlord: Address,
         tenant: Address,
         rent_amount: i128,
-        rent_rate_type: RateType,
+        rent_per_second: i128,
+        deposit_amount: i128,
         duration: u64,
-        grace_period_end: u64,
-        late_fee_flat: i128,
-        late_fee_amount: i128,
-        late_fee_rate_type: RateType,
-        nft_contract_addr: Address,
-        token_id: u128,
+        property_uri: String,
         payment_token: Address,
-    ) -> Result<Symbol, LeaseError> {
-        if env.storage().instance().has(&lease_id) {
-            return Err(LeaseError::LeaseAlreadyExists);
-        }
-
+        billing_frequency: u64,
+        rent_treasury_address: Address,
+    ) -> Result<u64, LeaseError> {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
         Self::require_stablecoin(&env, &payment_token)?;
-
-        let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
-        nft_client.transfer_from(
-            &env.current_contract_address(),
-            &landlord,
-            &env.current_contract_address(),
-            &token_id,
-        );
-
-        let now = env.ledger().timestamp();
-        let expiry_time = now.saturating_add(duration);
-        let lease = Lease {
-            landlord,
+        
+        let current_time = env.ledger().timestamp();
+        let lease_id = env.ledger().sequence();
+        let end_time = current_time.saturating_add(duration);
+        
+        // Create lease instance with continuous billing support
+        let lease_instance = LeaseInstance {
+            landlord: landlord.clone(),
             tenant: tenant.clone(),
-            rent_per_sec: to_per_second(rent_amount, rent_rate_type),
-            late_fee_per_sec: to_per_second(late_fee_amount, late_fee_rate_type),
-            deposit_amount: 0,
-            start_date: now,
-            end_date: expiry_time,
-            property_uri: String::from_str(&env, ""),
+            rent_amount,
+            deposit_amount,
+            security_deposit: deposit_amount,
+            start_date: current_time,
+            end_date: end_time,
+            property_uri: property_uri.clone(),
             status: LeaseStatus::Active,
-            nft_contract: Some(nft_contract_addr.clone()),
-            token_id: Some(token_id),
+            nft_contract: None,
+            token_id: None,
             active: true,
-            grace_period_end,
-            late_fee_flat,
-            debt: 0,
-            flat_fee_applied: false,
-            seconds_late_charged: 0,
             rent_paid: 0,
-            expiry_time,
+            expiry_time: end_time,
             buyout_price: None,
             cumulative_payments: 0,
-            payment_token,
+            debt: 0,
+            rent_paid_through: current_time,
+            deposit_status: DepositStatus::Held,
+            rent_per_sec: rent_per_second,
+            grace_period_end: end_time,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            withdrawal_address: None,
+            rent_withdrawn: 0,
+            arbitrators: Vec::new(&env),
+            maintenance_status: MaintenanceStatus::None,
+            withheld_rent: 0,
+            repair_proof_hash: None,
+            inspector: None,
+            paused: false,
+            pause_reason: None,
+            paused_at: None,
+            pause_initiator: None,
+            total_paused_duration: 0,
+            rent_pull_authorized_amount: Some(rent_amount * 12), // 12 months authorization
+            last_rent_pull_timestamp: Some(current_time),
+            billing_cycle_duration: billing_frequency,
+            continuous_billing_enabled: true,
+            rent_treasury_address: Some(rent_treasury_address.clone()),
+            yield_delegation_enabled: false,
+            yield_accumulated: 0,
+            equity_balance: 0,
+            equity_percentage_bps: 0,
+            had_late_payment: false,
+            has_pet: false,
+            pet_deposit_amount: 0,
+            pet_rent_amount: 0,
+            payment_token: payment_token.clone(),
         };
-
-        save_usage_rights(
-            &env,
-            nft_contract_addr.clone(),
-            token_id,
-            &UsageRights {
-                renter: tenant,
-                nft_contract: lease.nft_contract.clone().unwrap(),
-                token_id,
-                lease_id: lease_id.clone(),
-                valid_until: expiry_time,
-            },
-        );
-
-        env.storage().instance().set(&lease_id, &lease);
-        Ok(symbol_short!("created"))
+        
+        // Save lease instance
+        save_lease_instance(&env, &lease_id, &lease_instance);
+        
+        // Register lease with continuous billing module
+        ContinuousBillingModule::register_lease_billing(
+            env.clone(),
+            lease_id,
+            landlord.clone(),
+            tenant.clone(),
+            Address::from_string(&env, "property_asset"), // Placeholder for asset address
+            rent_amount,
+            rent_per_second,
+            payment_token.clone(),
+            current_time,
+            end_time,
+            billing_frequency,
+        ).map_err(|_| LeaseError::Unauthorised)?; // Convert billing module error
+        
+        // Emit lease creation event
+        LeaseStarted {
+            id: lease_id,
+            renter: tenant,
+            rate: rent_per_second,
+        }
+        .publish(&env);
+        
+        Ok(lease_id)
     }
 
     pub fn activate_lease(env: Env, lease_id: Symbol, tenant: Address) -> Symbol {
