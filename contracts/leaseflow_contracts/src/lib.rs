@@ -298,6 +298,19 @@ pub enum DataKey {
     OracleConfig(BytesN<32>),
     FallbackHierarchy,
     OracleFailureTimestamp(BytesN<32>),
+    // Issue #117: Multi-Sig Veto
+    SecurityCouncil,
+    PendingSlash(u64),
+    VetoVote(u64, Address),
+    // Issue #118: Dynamic Protocol Fees
+    ProtocolFeeConfig,
+    PendingFeeUpdate,
+    // Issue #119: Quadratic Voting
+    GovernanceRound(u64),
+    TreasuryVote(u64, Address),
+    VotingPowerSnapshot(u64, Address),
+    // Issue #124: Active Leases Index
+    ActiveLeasesIndex,
 }
 
 #[contracttype]
@@ -325,6 +338,131 @@ pub struct YieldDistribution {
     pub lessee_bps: u32,
     pub lessor_bps: u32,
     pub dao_bps: u32,
+}
+
+// ============================================================================
+// Issue #117: Multi-Sig Veto on Massive Deposit Slashing
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilMember {
+    pub address: Address,
+    pub voting_power: u32, // Weighted voting power
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncil {
+    pub members: soroban_sdk::Vec<SecurityCouncilMember>,
+    pub veto_threshold_bps: u32, // Basis points required for veto (e.g., 6000 = 60%)
+    pub total_voting_power: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSlashVeto {
+    pub lease_id: u64,
+    pub slash_amount: i128,
+    pub tenant_refund: i128,
+    pub landlord_payout: i128,
+    pub oracle_payload: OraclePayload,
+    pub proposed_at: u64,
+    pub timelock_end: u64,
+    pub veto_votes_for: u32,
+    pub veto_votes_against: u32,
+    pub executed: bool,
+    pub vetoed: bool,
+}
+
+// ============================================================================
+// Issue #118: DAO-Governed Dynamic Protocol Fee Updates
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeConfig {
+    pub current_fee_bps: u32, // Current fee in basis points
+    pub max_fee_bps: u32,     // Maximum allowed fee (hard cap)
+    pub min_fee_bps: u32,     // Minimum allowed fee
+    pub max_increase_bps: u32, // Maximum increase per update (e.g., 500 = 5%)
+    pub update_timelock: u64,  // Timelock period before changes take effect
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingFeeUpdate {
+    pub proposed_fee_bps: u32,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execution_time: u64,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub executed: bool,
+}
+
+// ============================================================================
+// Issue #119: Quadratic Voting for Treasury Yield Allocation
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceRound {
+    pub round_id: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub total_treasury_yield: i128,
+    pub allocation_options: soroban_sdk::Vec<AllocationOption>,
+    pub active: bool,
+    pub snapshot_timestamp: u64, // Snapshot to prevent flash loan attacks
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocationOption {
+    pub option_id: u32,
+    pub description: String,
+    pub total_quadratic_votes: i128, // Sum of sqrt(voting_power)
+    pub recipient_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryVote {
+    pub round_id: u64,
+    pub voter: Address,
+    pub option_id: u32,
+    pub tokens_committed: i128, // Tokens committed for voting
+    pub voting_power: i128,     // Quadratic voting power: sqrt(tokens)
+    pub voted_at: u64,
+}
+
+// ============================================================================
+// Issue #124: Highly Optimized get_active_leases Read-Only Query
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveLeaseSummary {
+    pub lease_id: u64,
+    pub landlord: Address,
+    pub tenant: Address,
+    pub rent_amount: i128,
+    pub rent_per_sec: i128,
+    pub deposit_amount: i128,
+    pub security_deposit: i128,
+    pub start_date: u64,
+    pub end_date: u64,
+    pub property_uri: String,
+    pub status: LeaseStatus,
+    pub payment_token: Address,
+    pub rent_paid: i128,
+    pub cumulative_payments: i128,
+    pub debt: i128,
+    pub active: bool,
+    pub yield_delegation_enabled: bool,
+    pub equity_percentage_bps: u32,
 }
 
 #[contractevent]
@@ -541,6 +679,17 @@ pub enum LeaseError {
     FallbackHierarchyNotConfigured = 31,
     DaoArbitrationNotEnabled = 32,
     OracleBypassAttempt = 33,
+    // Issue #117: Multi-Sig Veto errors
+    PendingVeto = 34,
+    TimelockNotExpired = 35,
+    AlreadyVoted = 36,
+    InvalidState = 37,
+    // Issue #118: Dynamic Fee errors
+    ProposalRejected = 38,
+    InvalidParameters = 39,
+    // Issue #119: Quadratic Voting errors
+    GovernanceRoundEnded = 40,
+    GovernanceRoundActive = 41,
 }
 
 macro_rules! require {
@@ -557,6 +706,22 @@ const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
 const STALENESS_THRESHOLD: u64 = 48 * 60 * 60; // 48 hours in seconds
 const BACKUP_FAILURE_THRESHOLD: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
 const MAX_ORACLE_FAILURES: u32 = 3;
+
+// Issue #117: Multi-Sig Veto Constants
+const MASSIVE_SLASH_THRESHOLD: i128 = 10000_0000000; // 10,000 tokens (in smallest units)
+const VETO_TIMELOCK_PERIOD: u64 = 24 * 60 * 60; // 24 hours timelock for massive slashes
+const DEFAULT_VETO_THRESHOLD_BPS: u32 = 6000; // 60% of council voting power
+
+// Issue #118: Dynamic Protocol Fee Constants
+const DEFAULT_MAX_FEE_BPS: u32 = 3000; // 30% max fee cap
+const DEFAULT_MIN_FEE_BPS: u32 = 0;    // 0% minimum fee
+const DEFAULT_MAX_INCREASE_BPS: u32 = 500; // 5% max increase per update
+const DEFAULT_FEE_TIMELOCK: u64 = 7 * 24 * 60 * 60; // 7 days timelock
+const DEFAULT_PROTOCOL_FEE_BPS: u32 = 100; // 1% default fee
+
+// Issue #119: Quadratic Voting Constants
+const GOVERNANCE_ROUND_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days voting period
+const FLASH_LOAN_PROTECTION_BUFFER: u64 = 24 * 60 * 60; // 24 hours snapshot before round
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -751,6 +916,17 @@ impl LeaseContract {
             .has(&DataKey::AllowedAsset(token.clone()))
     }
 
+    /// Adds a token address to the allowlist of accepted payment assets.
+    ///
+    /// # Parameters
+    /// - `admin` – Must match the stored admin address.
+    /// - `asset` – Token contract address to whitelist.
+    ///
+    /// # Errors
+    /// - [`LeaseError::Unauthorised`] – Caller is not the stored admin.
+    ///
+    /// # Authorization
+    /// Requires `admin.require_auth()`.
     pub fn add_allowed_asset(env: Env, admin: Address, asset: Address) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
@@ -781,6 +957,17 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Sets the on-chain KYC provider contract address.
+    ///
+    /// # Parameters
+    /// - `admin`    – Must match the stored admin address.
+    /// - `provider` – Address of the KYC verification contract.
+    ///
+    /// # Errors
+    /// - [`LeaseError::Unauthorised`] – Caller is not the stored admin.
+    ///
+    /// # Authorization
+    /// Requires `admin.require_auth()`.
     pub fn set_kyc_provider(env: Env, admin: Address, provider: Address) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
@@ -1142,6 +1329,27 @@ impl LeaseContract {
         None
     }
 
+    /// Creates a new `LeaseInstance` in persistent storage.
+    ///
+    /// Validates KYC, whitelisted payment token, and uniqueness of `lease_id`.
+    /// Optionally swaps the tenant's deposit asset via a DEX path payment before
+    /// locking it as collateral. Initialises the velocity guard for the landlord
+    /// and adds the lease to the active-leases index.
+    ///
+    /// # Parameters
+    /// - `lease_id` – Unique numeric identifier for this lease.
+    /// - `landlord` – Landlord address; must be KYC-verified.
+    /// - `params`   – Full set of lease creation parameters (see [`CreateLeaseParams`]).
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseAlreadyExists`] – A lease with `lease_id` already exists.
+    /// - [`LeaseError::KycRequired`]        – Landlord or tenant is not KYC-verified.
+    /// - [`LeaseError::InvalidAsset`]       – Payment token is not on the allowlist.
+    /// - [`LeaseError::PathPaymentFailed`]  – DEX swap path is empty.
+    /// - [`LeaseError::SlippageExceeded`]   – DEX swap output is below `max_slippage_bps`.
+    ///
+    /// # Authorization
+    /// Requires `landlord.require_auth()` and `params.tenant.require_auth()`.
     pub fn create_lease_instance(
         env: Env,
         lease_id: u64,
@@ -1225,6 +1433,9 @@ impl LeaseContract {
         };
         save_lease_instance(&env, lease_id, &lease);
 
+        // Add to active leases index for optimized querying (Issue #124)
+        Self::add_to_active_leases_index(&env, lease_id)?;
+
         // Initialize velocity tracker for landlord and update portfolio size
         VelocityGuard::initialize_lessor(&env, &landlord)?;
         VelocityGuard::update_portfolio_size(&env, &landlord, 1)?;
@@ -1237,6 +1448,10 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Returns the [`LeaseInstance`] for `lease_id`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
         load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
     }
@@ -1258,6 +1473,23 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Accepts a rent payment from the primary tenant or an authorised co-payer.
+    ///
+    /// Transfers `payment_amount` tokens from `payer` to the contract, updates
+    /// cumulative accounting, and triggers buyout logic if the total crosses
+    /// `buyout_price`.
+    ///
+    /// # Parameters
+    /// - `lease_id`       – ID of the target lease.
+    /// - `payer`          – Address making the payment.
+    /// - `payment_amount` – Amount in the lease's payment token (smallest unit).
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `payer` is neither the tenant nor an authorised payer.
+    ///
+    /// # Authorization
+    /// Requires `payer.require_auth()`.
     pub fn pay_lease_instance_rent(
         env: Env,
         lease_id: u64,
@@ -1362,6 +1594,23 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Terminates a lease after its `end_date` has passed and the deposit is settled.
+    ///
+    /// Archives the lease record and pays a small bounty to the caller from the
+    /// platform fee vault to incentivise timely cleanup.
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the lease to terminate.
+    /// - `caller`   – Must be the landlord, tenant, or admin.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]     – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]      – Caller is not landlord, tenant, or admin.
+    /// - [`LeaseError::LeaseNotExpired`]   – Current time is before `end_date`.
+    /// - [`LeaseError::DepositNotSettled`] – Deposit is still `Held` or `Disputed`.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
     pub fn terminate_lease(env: Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
         let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
 
@@ -2524,6 +2773,37 @@ impl LeaseContract {
         let tenant_refund = total_deposit.saturating_sub(penalty_amount);
         let landlord_payout = penalty_amount;
 
+        // Issue #117: Check if this is a massive slash requiring multi-sig veto
+        if landlord_payout >= MASSIVE_SLASH_THRESHOLD {
+            // Check if security council is initialized
+            if env.storage().instance().get(&DataKey::SecurityCouncil).is_some() {
+                // Create pending slash with timelock
+                let current_time = env.ledger().timestamp();
+                let pending_slash = PendingSlashVeto {
+                    lease_id: payload.lease_id,
+                    slash_amount: penalty_amount,
+                    tenant_refund,
+                    landlord_payout,
+                    oracle_payload: payload.clone(),
+                    proposed_at: current_time,
+                    timelock_end: current_time + VETO_TIMELOCK_PERIOD,
+                    veto_votes_for: 0,
+                    veto_votes_against: 0,
+                    executed: false,
+                    vetoed: false,
+                };
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingSlash(payload.lease_id), &pending_slash);
+
+                // Don't execute immediately - wait for veto period
+                return Err(LeaseError::PendingVeto);
+            }
+        }
+
+        // Standard slash execution (no veto or council not initialized)
+
         if payload.damage_severity as u32 >= DamageSeverity::Severe as u32
             && penalty_amount >= total_deposit
         {
@@ -2997,6 +3277,7 @@ impl LeaseContract {
 mod test;
 mod upgrade_tests;
 mod oracle_fallback_tests;
+mod governance_tests;
 
 // Global Escrow Freeze Circuit Breaker Modules
 pub mod escrow_vault;
@@ -3006,3 +3287,10 @@ pub mod escrow_freeze_tests;
 // Flash Crash Protection Modules - Issue #114
 pub mod collateral_health_monitor;
 pub mod collateral_health_tests;
+
+// Issue #132: Ledger Rent Sweeper for Expired Lease Proposals
+pub mod expired_proposals;
+
+// Issue #131: Performance Stress Test — 500 Concurrent Lease Actions
+#[cfg(test)]
+mod stress_tests;
