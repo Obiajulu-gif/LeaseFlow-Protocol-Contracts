@@ -2,6 +2,23 @@
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, env, symbol, Address, Bytes, Symbol, Vec, Map, U256, i64, u64};
 use leaseflow_math::{calculate_prorated_rent, calculate_termination_refund};
 
+// SEP-40 Oracle interface
+#[contracttype]
+pub struct PriceData {
+    pub price: i128,
+    pub timestamp: u64,
+    pub asset: Address,
+    pub decimals: u32,
+}
+
+#[contracttype]
+pub struct OracleConfig {
+    pub oracle_address: Address,
+    pub staleness_threshold: u64, // 15 minutes = 900 seconds
+    pub volatility_threshold: u32, // 20% = 2000 basis points
+    pub max_price_age: u64, // Maximum age for price data
+}
+
 // Contract state key
 const DATA_KEY: Symbol = symbol!("DATA");
 
@@ -33,6 +50,11 @@ pub enum Error {
     ArrearsAlreadyProcessed = 12,
     EscrowVaultUnderflow = 13,
     CreditRecordError = 14,
+    OracleDataStale = 15,
+    OraclePriceManipulation = 16,
+    VolatilityCircuitBreaker = 17,
+    OracleCallFailed = 18,
+    InvalidFiatPegConfig = 19,
 }
 
 // Events
@@ -97,6 +119,16 @@ pub struct ProratedRentCalculatedEvent {
     pub calculation_type: Symbol, // "initialization" or "termination"
 }
 
+#[contracttype]
+pub struct FiatPeggedRentBilledEvent {
+    pub lease_id: u64,
+    pub target_usd_amount: i64,
+    pub oracle_exchange_rate: i128,
+    pub final_crypto_deduction: i64,
+    pub billing_timestamp: u64,
+    pub asset_address: Address,
+}
+
 // Protocol Credit Record for tracking residual debt
 #[derive(Clone, Debug, contracttype)]
 pub struct ProtocolCreditRecord {
@@ -113,6 +145,17 @@ pub struct EscrowVault {
     pub total_locked: i64,
     pub available_balance: i64,
     pub lessor_treasury: i64,
+}
+
+// Fiat peg configuration for dynamic pricing
+#[derive(Clone, Debug, contracttype)]
+pub struct FiatPegConfig {
+    pub enabled: bool,
+    pub target_usd_amount: i64, // Target USD amount per billing cycle
+    pub asset_address: Address, // Crypto asset address (e.g., XLM)
+    pub oracle_address: Address, // SEP-40 Oracle address
+    pub staleness_threshold: u64, // Seconds before data is considered stale
+    pub volatility_threshold: u32, // Basis points for volatility circuit breaker
 }
 
 // Lease structure
@@ -136,6 +179,9 @@ pub struct Lease {
     pub arrears_processed: bool, // Track if arrears deduction has been executed
     pub prorated_initial_rent: i64, // Track prorated rent for initial partial period
     pub total_paid_rent: i64, // Track total rent paid for refund calculations
+    pub fiat_peg_config: Option<FiatPegConfig>, // Dynamic fiat peg configuration
+    pub last_oracle_price: Option<i128>, // Cache last oracle price for volatility detection
+    pub last_oracle_timestamp: Option<u64>, // Cache last oracle timestamp for staleness check
 }
 
 // Contract data structure
@@ -145,6 +191,7 @@ pub struct ContractData {
     pub next_lease_id: u64,
     pub escrow_vault: EscrowVault,
     pub credit_records: Map<Address, ProtocolCreditRecord>,
+    pub oracle_config: OracleConfig, // Global oracle configuration
 }
 
 // Contract implementation
@@ -154,11 +201,18 @@ pub struct LeaseFlowContract;
 #[contractimpl]
 impl LeaseFlowContract {
     // Initialize contract
-    pub fn initialize(env: env::Env) {
+    pub fn initialize(env: env::Env, oracle_address: Address) {
         let escrow_vault = EscrowVault {
             total_locked: 0,
             available_balance: 0,
             lessor_treasury: 0,
+        };
+        
+        let oracle_config = OracleConfig {
+            oracle_address: oracle_address.clone(),
+            staleness_threshold: 900, // 15 minutes
+            volatility_threshold: 2000, // 20% in basis points
+            max_price_age: 3600, // 1 hour maximum age
         };
         
         let data = ContractData {
@@ -166,6 +220,7 @@ impl LeaseFlowContract {
             next_lease_id: 1,
             escrow_vault,
             credit_records: Map::new(&env),
+            oracle_config,
         };
         env.storage().instance().set(&DATA_KEY, &data);
     }
@@ -182,6 +237,7 @@ impl LeaseFlowContract {
         max_grace_period: u64,
         late_fee_rate: u32,
         property_uri: Bytes,
+        fiat_peg_config: Option<FiatPegConfig>,
     ) -> Result<u64, Error> {
         if rent_amount <= 0 || deposit_amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -189,6 +245,16 @@ impl LeaseFlowContract {
 
         if start_date >= end_date {
             return Err(Error::InvalidAmount);
+        }
+
+        // Validate fiat peg configuration if provided
+        if let Some(ref config) = fiat_peg_config {
+            if config.target_usd_amount <= 0 {
+                return Err(Error::InvalidFiatPegConfig);
+            }
+            if config.staleness_threshold == 0 || config.volatility_threshold == 0 {
+                return Err(Error::InvalidFiatPegConfig);
+            }
         }
 
         let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
@@ -224,6 +290,9 @@ impl LeaseFlowContract {
             arrears_processed: false,
             prorated_initial_rent,
             total_paid_rent: 0,
+            fiat_peg_config,
+            last_oracle_price: None,
+            last_oracle_timestamp: None,
         };
 
         data.leases.set(lease_id, lease);
@@ -592,6 +661,129 @@ impl LeaseFlowContract {
     pub fn get_escrow_vault(env: env::Env) -> Result<EscrowVault, Error> {
         let data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
         Ok(data.escrow_vault)
+    }
+
+    // Fetch price data from SEP-40 Oracle with security checks
+    fn get_oracle_price(env: &env::Env, lease: &Lease, oracle_address: &Address) -> Result<PriceData, Error> {
+        let current_timestamp = env.ledger().timestamp();
+        
+        // Call SEP-40 Oracle to get price data
+        let oracle_client = soroban_sdk::contractclient::ContractClient::new(env, oracle_address);
+        let price_data: PriceData = oracle_client.invoke(
+            &symbol!("get_price"),
+            &lease.fiat_peg_config.as_ref().unwrap().asset_address,
+        ).try_into().map_err(|_| Error::OracleCallFailed)?;
+        
+        // Staleness check
+        if current_timestamp.saturating_sub(price_data.timestamp) > lease.fiat_peg_config.as_ref().unwrap().staleness_threshold {
+            return Err(Error::OracleDataStale);
+        }
+        
+        // Additional security: ensure price is not too old
+        if current_timestamp.saturating_sub(price_data.timestamp) > 3600 { // 1 hour max
+            return Err(Error::OracleDataStale);
+        }
+        
+        // Flash loan attack protection: check for extreme price changes
+        if let (Some(last_price), Some(last_timestamp)) = (lease.last_oracle_price, lease.last_oracle_timestamp) {
+            let time_diff = current_timestamp.saturating_sub(last_timestamp);
+            
+            // Only check volatility if we have recent data (within last hour)
+            if time_diff <= 3600 && last_price > 0 {
+                let price_change_percent = if price_data.price > last_price {
+                    ((price_data.price - last_price) * 10000) / last_price
+                } else {
+                    ((last_price - price_data.price) * 10000) / last_price
+                };
+                
+                // If price change exceeds threshold, trigger circuit breaker
+                if price_change_percent > lease.fiat_peg_config.as_ref().unwrap().volatility_threshold as i128 {
+                    return Err(Error::VolatilityCircuitBreaker);
+                }
+            }
+        }
+        
+        Ok(price_data)
+    }
+
+    // Calculate fiat-pegged rent amount
+    fn calculate_fiat_pegged_rent(env: &env::Env, lease: &Lease) -> Result<i64, Error> {
+        let config = lease.fiat_peg_config.as_ref().ok_or(Error::InvalidFiatPegConfig)?;
+        
+        if !config.enabled {
+            return Ok(lease.rent_amount); // Return fixed amount if not enabled
+        }
+        
+        // Get current price from oracle
+        let price_data = Self::get_oracle_price(env, lease, &config.oracle_address)?;
+        
+        // Convert USD target to crypto amount
+        // Formula: crypto_amount = (target_usd * 10^decimals) / price
+        let decimals_factor = 10i128.pow(price_data.decimals);
+        let usd_target_i128 = config.target_usd_amount as i128;
+        
+        let crypto_amount_i128 = (usd_target_i128 * decimals_factor) / price_data.price;
+        
+        // Convert to i64 with safety check
+        let crypto_amount = if crypto_amount_i128 > i64::MAX as i128 {
+            return Err(Error::InvalidAmount);
+        } else {
+            crypto_amount_i128 as i64
+        };
+        
+        // Ensure minimum rent amount
+        if crypto_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        
+        Ok(crypto_amount)
+    }
+
+    // Process fiat-pegged rent payment
+    pub fn process_fiat_pegged_rent_payment(env: env::Env, lease_id: u64) -> Result<(), Error> {
+        let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
+        let mut lease = data.leases.get(lease_id).ok_or(Error::LeaseNotFound)?;
+        
+        // Only process for active leases with fiat peg enabled
+        if lease.state != LeaseState::Active {
+            return Err(Error::LeaseNotActive);
+        }
+        
+        let config = lease.fiat_peg_config.as_ref().ok_or(Error::InvalidFiatPegConfig)?;
+        if !config.enabled {
+            return Err(Error::InvalidFiatPegConfig);
+        }
+        
+        // Calculate current rent amount based on oracle
+        let current_rent_amount = Self::calculate_fiat_pegged_rent(&env, &lease)?;
+        
+        // Get oracle price data for event emission
+        let price_data = Self::get_oracle_price(&env, &lease, &config.oracle_address)?;
+        
+        // Update lease with new oracle data for next volatility check
+        lease.last_oracle_price = Some(price_data.price);
+        lease.last_oracle_timestamp = Some(price_data.timestamp);
+        lease.last_rent_payment_timestamp = env.ledger().timestamp();
+        lease.total_paid_rent += current_rent_amount;
+        
+        // Emit FiatPeggedRentBilled event
+        env.events().publish(
+            symbol!("FiatPeggedRentBilled"),
+            FiatPeggedRentBilledEvent {
+                lease_id,
+                target_usd_amount: config.target_usd_amount,
+                oracle_exchange_rate: price_data.price,
+                final_crypto_deduction: current_rent_amount,
+                billing_timestamp: env.ledger().timestamp(),
+                asset_address: config.asset_address.clone(),
+            },
+        );
+        
+        // Save updated lease
+        data.leases.set(lease_id, lease);
+        env.storage().instance().set(&DATA_KEY, &data);
+        
+        Ok(())
     }
 
     // Emergency function to manually trigger grace period check

@@ -548,6 +548,7 @@ mod test {
             &432000,
             &500,
             &Bytes::from_slice(&env, b"property_uri"),
+            &None, // No fiat peg
         );
 
         client.activate_lease(&lease_id, &lessee);
@@ -558,6 +559,450 @@ mod test {
         
         let lease = client.get_lease(&lease_id);
         assert_eq!(lease.total_paid_rent, 2000); // Should track total payments
+    }
+
+    #[test]
+    fn test_fiat_pegged_lease_creation() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100, // $100 USD target
+            asset_address: asset_address.clone(),
+            oracle_address: oracle_address.clone(),
+            staleness_threshold: 900, // 15 minutes
+            volatility_threshold: 2000, // 20%
+        };
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000, // Base rent in XLM
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        let lease = client.get_lease(&lease_id);
+        assert!(lease.fiat_peg_config.is_some());
+        let config = lease.fiat_peg_config.unwrap();
+        assert_eq!(config.target_usd_amount, 100);
+        assert_eq!(config.asset_address, asset_address);
+        assert_eq!(config.oracle_address, oracle_address);
+    }
+
+    #[test]
+    fn test_fiat_pegged_rent_calculation_bull_market() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        // Mock oracle for bull market (XLM price increases from $0.10 to $0.20)
+        let mock_oracle = MockSep40Oracle::new(&env);
+        mock_oracle.set_price(&asset_address, &200000000, &7); // $0.20 with 7 decimals
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900,
+            volatility_threshold: 2000,
+        };
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Process fiat-pegged rent - should require less XLM due to higher price
+        client.process_fiat_pegged_rent_payment(&lease_id);
+        
+        let lease = client.get_lease(&lease_id);
+        // At $0.20 per XLM, $100 USD = 500 XLM (100 / 0.20)
+        assert_eq!(lease.total_paid_rent, 500);
+    }
+
+    #[test]
+    fn test_fiat_pegged_rent_calculation_bear_market() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        // Mock oracle for bear market (XLM price drops to $0.05)
+        let mock_oracle = MockSep40Oracle::new(&env);
+        mock_oracle.set_price(&asset_address, &50000000, &7); // $0.05 with 7 decimals
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900,
+            volatility_threshold: 2000,
+        };
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Process fiat-pegged rent - should require more XLM due to lower price
+        client.process_fiat_pegged_rent_payment(&lease_id);
+        
+        let lease = client.get_lease(&lease_id);
+        // At $0.05 per XLM, $100 USD = 2000 XLM (100 / 0.05)
+        assert_eq!(lease.total_paid_rent, 2000);
+    }
+
+    #[test]
+    fn test_oracle_staleness_protection() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        // Mock oracle with stale price (20 minutes old)
+        let mock_oracle = MockSep40Oracle::new(&env);
+        let stale_timestamp = env.ledger().timestamp() - 1200; // 20 minutes ago
+        mock_oracle.set_price_with_timestamp(&asset_address, &100000000, &7, &stale_timestamp);
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900, // 15 minutes
+            volatility_threshold: 2000,
+        };
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Should fail due to stale oracle data
+        let result = client.try_process_fiat_pegged_rent_payment(&lease_id);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Error::OracleDataStale);
+    }
+
+    #[test]
+    fn test_volatility_circuit_breaker() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        let mock_oracle = MockSep40Oracle::new(&env);
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900,
+            volatility_threshold: 2000, // 20%
+        };
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // First payment with normal price
+        mock_oracle.set_price(&asset_address, &100000000, &7); // $0.10
+        client.process_fiat_pegged_rent_payment(&lease_id);
+        
+        // Advance time by 30 minutes
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1800);
+        
+        // Second payment with extreme price change (50% increase)
+        mock_oracle.set_price(&asset_address, &150000000, &7); // $0.15 (+50%)
+        
+        // Should fail due to volatility circuit breaker
+        let result = client.try_process_fiat_pegged_rent_payment(&lease_id);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Error::VolatilityCircuitBreaker);
+    }
+
+    #[test]
+    fn test_12_month_lease_simulation_bull_market() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        let mock_oracle = MockSep40Oracle::new(&env);
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900,
+            volatility_threshold: 2000,
+        };
+        
+        let start_time = env.ledger().timestamp();
+        let end_time = start_time + 12 * 30 * 86400; // 12 months
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &start_time,
+            &end_time,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Simulate 12 months of bull market (price increasing from $0.10 to $0.50)
+        let mut total_paid = 0;
+        for month in 0..12 {
+            let price = 100000000 + (month as i128 * 33333333); // Linear increase
+            mock_oracle.set_price(&asset_address, &price, &7);
+            
+            env.ledger().set_timestamp(start_time + (month + 1) * 30 * 86400);
+            client.process_fiat_pegged_rent_payment(&lease_id);
+            
+            let lease = client.get_lease(&lease_id);
+            total_paid = lease.total_paid_rent;
+        }
+        
+        // In bull market, total XLM paid should decrease over time
+        // Early months: ~1000 XLM, Later months: ~200 XLM
+        assert!(total_paid < 12000); // Should be significantly less than fixed 12000 XLM
+        assert!(total_paid > 2400);  // But still reasonable amount
+    }
+
+    #[test]
+    fn test_12_month_lease_simulation_bear_market() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        let mock_oracle = MockSep40Oracle::new(&env);
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900,
+            volatility_threshold: 2000,
+        };
+        
+        let start_time = env.ledger().timestamp();
+        let end_time = start_time + 12 * 30 * 86400; // 12 months
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &start_time,
+            &end_time,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Simulate 12 months of bear market (price decreasing from $0.10 to $0.02)
+        let mut total_paid = 0;
+        for month in 0..12 {
+            let price = 100000000 - (month as i128 * 6666666); // Linear decrease
+            mock_oracle.set_price(&asset_address, &price.max(20000000), &7);
+            
+            env.ledger().set_timestamp(start_time + (month + 1) * 30 * 86400);
+            client.process_fiat_pegged_rent_payment(&lease_id);
+            
+            let lease = client.get_lease(&lease_id);
+            total_paid = lease.total_paid_rent;
+        }
+        
+        // In bear market, total XLM paid should increase over time
+        // Early months: ~1000 XLM, Later months: ~5000 XLM
+        assert!(total_paid > 12000); // Should be significantly more than fixed 12000 XLM
+        assert!(total_paid < 60000); // But still reasonable
+    }
+
+    #[test]
+    fn test_flash_loan_attack_protection() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        let oracle_address = Address::generate(&env);
+        client.initialize_with_oracle(&oracle_address);
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let asset_address = Address::generate(&env);
+        
+        let mock_oracle = MockSep40Oracle::new(&env);
+        
+        let fiat_peg_config = FiatPegConfig {
+            enabled: true,
+            target_usd_amount: 100,
+            asset_address: asset_address.clone(),
+            oracle_address: mock_oracle.address.clone(),
+            staleness_threshold: 900,
+            volatility_threshold: 2000, // 20% threshold
+        };
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+            &Some(fiat_peg_config),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // First payment with normal price
+        mock_oracle.set_price(&asset_address, &100000000, &7); // $0.10
+        client.process_fiat_pegged_rent_payment(&lease_id);
+        
+        // Simulate flash loan attack - extreme price manipulation in same block
+        mock_oracle.set_price(&asset_address, &50000000, &7); // 50% drop
+        
+        // Should fail due to volatility circuit breaker protecting against flash loan attacks
+        let result = client.try_process_fiat_pegged_rent_payment(&lease_id);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Error::VolatilityCircuitBreaker);
+    }
+
+    // Mock SEP-40 Oracle for testing
+    struct MockSep40Oracle {
+        env: Env,
+        address: Address,
+        prices: Map<Address, (i128, u32, u64)>, // (price, decimals, timestamp)
+    }
+    
+    impl MockSep40Oracle {
+        fn new(env: &Env) -> Self {
+            let address = Address::generate(env);
+            Self {
+                env: env.clone(),
+                address,
+                prices: Map::new(env),
+            }
+        }
+        
+        fn set_price(&self, asset: &Address, price: &i128, decimals: &u32) {
+            self.prices.set(asset, (*price, *decimals, self.env.ledger().timestamp()));
+        }
+        
+        fn set_price_with_timestamp(&self, asset: &Address, price: &i128, decimals: &u32, timestamp: &u64) {
+            self.prices.set(asset, (*price, *decimals, *timestamp));
+        }
     }
 
     struct LeaseFlowContractClient<'a> {
@@ -578,6 +1023,14 @@ mod test {
             );
         }
 
+        fn initialize_with_oracle(&self, oracle_address: &Address) {
+            self.env.invoke_contract(
+                self.contract_id,
+                &soroban_sdk::symbol!("initialize"),
+                soroban_sdk::xdr::ScVal::try_from(oracle_address).unwrap(),
+            );
+        }
+
         fn create_lease(
             &self,
             lessor: &Address,
@@ -589,13 +1042,14 @@ mod test {
             max_grace_period: &u64,
             late_fee_rate: &u32,
             property_uri: &Bytes,
+            fiat_peg_config: &Option<FiatPegConfig>,
         ) -> u64 {
             let result = self.env.invoke_contract(
                 self.contract_id,
                 &soroban_sdk::symbol!("create_lease"),
                 soroban_sdk::xdr::ScVal::try_from((
                     lessor, lessee, rent_amount, deposit_amount, 
-                    start_date, end_date, max_grace_period, late_fee_rate, property_uri
+                    start_date, end_date, max_grace_period, late_fee_rate, property_uri, fiat_peg_config
                 )).unwrap(),
             );
             result.try_into().unwrap()
@@ -683,6 +1137,23 @@ mod test {
                 self.contract_id,
                 &soroban_sdk::symbol!("terminate_lease"),
                 soroban_sdk::xdr::ScVal::try_from((lease_id, caller)).unwrap(),
+            );
+            result.try_into()
+        }
+
+        fn process_fiat_pegged_rent_payment(&self, lease_id: &u64) {
+            self.env.invoke_contract(
+                self.contract_id,
+                &soroban_sdk::symbol!("process_fiat_pegged_rent_payment"),
+                soroban_sdk::xdr::ScVal::try_from(lease_id).unwrap(),
+            );
+        }
+
+        fn try_process_fiat_pegged_rent_payment(&self, lease_id: &u64) -> Result<(), Error> {
+            let result = self.env.invoke_contract(
+                self.contract_id,
+                &soroban_sdk::symbol!("process_fiat_pegged_rent_payment"),
+                soroban_sdk::xdr::ScVal::try_from(lease_id).unwrap(),
             );
             result.try_into()
         }
