@@ -902,6 +902,17 @@ impl LeaseContract {
             .has(&DataKey::AllowedAsset(token.clone()))
     }
 
+    /// Adds a token address to the allowlist of accepted payment assets.
+    ///
+    /// # Parameters
+    /// - `admin` – Must match the stored admin address.
+    /// - `asset` – Token contract address to whitelist.
+    ///
+    /// # Errors
+    /// - [`LeaseError::Unauthorised`] – Caller is not the stored admin.
+    ///
+    /// # Authorization
+    /// Requires `admin.require_auth()`.
     pub fn add_allowed_asset(env: Env, admin: Address, asset: Address) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
@@ -932,6 +943,17 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Sets the on-chain KYC provider contract address.
+    ///
+    /// # Parameters
+    /// - `admin`    – Must match the stored admin address.
+    /// - `provider` – Address of the KYC verification contract.
+    ///
+    /// # Errors
+    /// - [`LeaseError::Unauthorised`] – Caller is not the stored admin.
+    ///
+    /// # Authorization
+    /// Requires `admin.require_auth()`.
     pub fn set_kyc_provider(env: Env, admin: Address, provider: Address) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
@@ -1264,6 +1286,27 @@ impl LeaseContract {
         None
     }
 
+    /// Creates a new `LeaseInstance` in persistent storage.
+    ///
+    /// Validates KYC, whitelisted payment token, and uniqueness of `lease_id`.
+    /// Optionally swaps the tenant's deposit asset via a DEX path payment before
+    /// locking it as collateral. Initialises the velocity guard for the landlord
+    /// and adds the lease to the active-leases index.
+    ///
+    /// # Parameters
+    /// - `lease_id` – Unique numeric identifier for this lease.
+    /// - `landlord` – Landlord address; must be KYC-verified.
+    /// - `params`   – Full set of lease creation parameters (see [`CreateLeaseParams`]).
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseAlreadyExists`] – A lease with `lease_id` already exists.
+    /// - [`LeaseError::KycRequired`]        – Landlord or tenant is not KYC-verified.
+    /// - [`LeaseError::InvalidAsset`]       – Payment token is not on the allowlist.
+    /// - [`LeaseError::PathPaymentFailed`]  – DEX swap path is empty.
+    /// - [`LeaseError::SlippageExceeded`]   – DEX swap output is below `max_slippage_bps`.
+    ///
+    /// # Authorization
+    /// Requires `landlord.require_auth()` and `params.tenant.require_auth()`.
     pub fn create_lease_instance(
         env: Env,
         lease_id: u64,
@@ -1362,6 +1405,10 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Returns the [`LeaseInstance`] for `lease_id`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
         load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
     }
@@ -1383,6 +1430,23 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Accepts a rent payment from the primary tenant or an authorised co-payer.
+    ///
+    /// Transfers `payment_amount` tokens from `payer` to the contract, updates
+    /// cumulative accounting, and triggers buyout logic if the total crosses
+    /// `buyout_price`.
+    ///
+    /// # Parameters
+    /// - `lease_id`       – ID of the target lease.
+    /// - `payer`          – Address making the payment.
+    /// - `payment_amount` – Amount in the lease's payment token (smallest unit).
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `payer` is neither the tenant nor an authorised payer.
+    ///
+    /// # Authorization
+    /// Requires `payer.require_auth()`.
     pub fn pay_lease_instance_rent(
         env: Env,
         lease_id: u64,
@@ -1487,6 +1551,23 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Terminates a lease after its `end_date` has passed and the deposit is settled.
+    ///
+    /// Archives the lease record and pays a small bounty to the caller from the
+    /// platform fee vault to incentivise timely cleanup.
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the lease to terminate.
+    /// - `caller`   – Must be the landlord, tenant, or admin.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]     – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]      – Caller is not landlord, tenant, or admin.
+    /// - [`LeaseError::LeaseNotExpired`]   – Current time is before `end_date`.
+    /// - [`LeaseError::DepositNotSettled`] – Deposit is still `Held` or `Disputed`.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
     pub fn terminate_lease(env: Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
         let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
 
@@ -3563,6 +3644,13 @@ impl LeaseContract {
     // Issue #124: Highly Optimized get_active_leases Read-Only Query
     // ========================================================================
 
+    /// Returns a summary of all currently active or pending leases.
+    ///
+    /// Read-only; performs no state mutations. Uses the `ActiveLeasesIndex` for
+    /// O(n) iteration rather than a full storage scan.
+    ///
+    /// # Returns
+    /// A [`Vec<ActiveLeaseSummary>`] containing one entry per active/pending lease.
     pub fn get_active_leases(env: Env) -> soroban_sdk::Vec<ActiveLeaseSummary> {
         // This is a read-only function - no state mutations
         // Returns comprehensive lease data for frontend rendering
@@ -3647,6 +3735,33 @@ impl LeaseContract {
 
         Ok(())
     }
+
+    // ========================================================================
+    // Issue #132: Ledger Rent Sweeper for Expired Lease Proposals
+    // ========================================================================
+
+    /// Permissionlessly sweep a single expired pending lease proposal.
+    ///
+    /// Any network relayer may call this function to delete a `Pending` lease
+    /// that has exceeded its 7-day initialization timeout without receiving a
+    /// security deposit. The relayer receives a small gas bounty from the
+    /// platform fee vault as an incentive.
+    ///
+    /// # Parameters
+    /// - `relayer`  – Address of the caller; receives the gas bounty.
+    /// - `lease_id` – ID of the candidate lease to sweep.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]   – No lease exists for `lease_id`.
+    /// - [`LeaseError::InvalidState`]    – Lease is not in `Pending` status.
+    /// - [`LeaseError::LeaseNotExpired`] – Initialization timeout has not elapsed.
+    pub fn sweep_expired_proposals(
+        env: Env,
+        relayer: Address,
+        lease_id: u64,
+    ) -> Result<(), LeaseError> {
+        expired_proposals::sweep_expired_proposals(&env, relayer, lease_id)
+    }
 }
 
 mod test;
@@ -3662,3 +3777,10 @@ pub mod escrow_freeze_tests;
 // Flash Crash Protection Modules - Issue #114
 pub mod collateral_health_monitor;
 pub mod collateral_health_tests;
+
+// Issue #132: Ledger Rent Sweeper for Expired Lease Proposals
+pub mod expired_proposals;
+
+// Issue #131: Performance Stress Test — 500 Concurrent Lease Actions
+#[cfg(test)]
+mod stress_tests;
