@@ -93,3 +93,4 @@ sequenceDiagram
 
 - **Landlord disputes the return condition** — If the landlord rejects the asset return (e.g. damage claim), the lease enters a `Disputed` state. The deposit is held in escrow until the dispute is resolved — either by on-chain arbitration logic or a manual settlement call. See `test_deposit_release_disputed` for the disputed-return snapshot.
 
+>>>>>>> a39c6ebec0c7dbd10a185bb4e5e3e831392f0358
