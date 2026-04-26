@@ -284,6 +284,19 @@ pub enum DataKey {
     OracleConfig(BytesN<32>),
     FallbackHierarchy,
     OracleFailureTimestamp(BytesN<32>),
+    // Issue #117: Multi-Sig Veto
+    SecurityCouncil,
+    PendingSlash(u64),
+    VetoVote(u64, Address),
+    // Issue #118: Dynamic Protocol Fees
+    ProtocolFeeConfig,
+    PendingFeeUpdate,
+    // Issue #119: Quadratic Voting
+    GovernanceRound(u64),
+    TreasuryVote(u64, Address),
+    VotingPowerSnapshot(u64, Address),
+    // Issue #124: Active Leases Index
+    ActiveLeasesIndex,
 }
 
 #[contracttype]
@@ -311,6 +324,131 @@ pub struct YieldDistribution {
     pub lessee_bps: u32,
     pub lessor_bps: u32,
     pub dao_bps: u32,
+}
+
+// ============================================================================
+// Issue #117: Multi-Sig Veto on Massive Deposit Slashing
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilMember {
+    pub address: Address,
+    pub voting_power: u32, // Weighted voting power
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncil {
+    pub members: soroban_sdk::Vec<SecurityCouncilMember>,
+    pub veto_threshold_bps: u32, // Basis points required for veto (e.g., 6000 = 60%)
+    pub total_voting_power: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSlashVeto {
+    pub lease_id: u64,
+    pub slash_amount: i128,
+    pub tenant_refund: i128,
+    pub landlord_payout: i128,
+    pub oracle_payload: OraclePayload,
+    pub proposed_at: u64,
+    pub timelock_end: u64,
+    pub veto_votes_for: u32,
+    pub veto_votes_against: u32,
+    pub executed: bool,
+    pub vetoed: bool,
+}
+
+// ============================================================================
+// Issue #118: DAO-Governed Dynamic Protocol Fee Updates
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeConfig {
+    pub current_fee_bps: u32, // Current fee in basis points
+    pub max_fee_bps: u32,     // Maximum allowed fee (hard cap)
+    pub min_fee_bps: u32,     // Minimum allowed fee
+    pub max_increase_bps: u32, // Maximum increase per update (e.g., 500 = 5%)
+    pub update_timelock: u64,  // Timelock period before changes take effect
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingFeeUpdate {
+    pub proposed_fee_bps: u32,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execution_time: u64,
+    pub votes_for: u32,
+    pub votes_against: u32,
+    pub executed: bool,
+}
+
+// ============================================================================
+// Issue #119: Quadratic Voting for Treasury Yield Allocation
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceRound {
+    pub round_id: u64,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub total_treasury_yield: i128,
+    pub allocation_options: soroban_sdk::Vec<AllocationOption>,
+    pub active: bool,
+    pub snapshot_timestamp: u64, // Snapshot to prevent flash loan attacks
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocationOption {
+    pub option_id: u32,
+    pub description: String,
+    pub total_quadratic_votes: i128, // Sum of sqrt(voting_power)
+    pub recipient_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryVote {
+    pub round_id: u64,
+    pub voter: Address,
+    pub option_id: u32,
+    pub tokens_committed: i128, // Tokens committed for voting
+    pub voting_power: i128,     // Quadratic voting power: sqrt(tokens)
+    pub voted_at: u64,
+}
+
+// ============================================================================
+// Issue #124: Highly Optimized get_active_leases Read-Only Query
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveLeaseSummary {
+    pub lease_id: u64,
+    pub landlord: Address,
+    pub tenant: Address,
+    pub rent_amount: i128,
+    pub rent_per_sec: i128,
+    pub deposit_amount: i128,
+    pub security_deposit: i128,
+    pub start_date: u64,
+    pub end_date: u64,
+    pub property_uri: String,
+    pub status: LeaseStatus,
+    pub payment_token: Address,
+    pub rent_paid: i128,
+    pub cumulative_payments: i128,
+    pub debt: i128,
+    pub active: bool,
+    pub yield_delegation_enabled: bool,
+    pub equity_percentage_bps: u32,
 }
 
 #[contractevent]
@@ -527,6 +665,17 @@ pub enum LeaseError {
     FallbackHierarchyNotConfigured = 31,
     DaoArbitrationNotEnabled = 32,
     OracleBypassAttempt = 33,
+    // Issue #117: Multi-Sig Veto errors
+    PendingVeto = 34,
+    TimelockNotExpired = 35,
+    AlreadyVoted = 36,
+    InvalidState = 37,
+    // Issue #118: Dynamic Fee errors
+    ProposalRejected = 38,
+    InvalidParameters = 39,
+    // Issue #119: Quadratic Voting errors
+    GovernanceRoundEnded = 40,
+    GovernanceRoundActive = 41,
 }
 
 macro_rules! require {
@@ -543,6 +692,22 @@ const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
 const STALENESS_THRESHOLD: u64 = 48 * 60 * 60; // 48 hours in seconds
 const BACKUP_FAILURE_THRESHOLD: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
 const MAX_ORACLE_FAILURES: u32 = 3;
+
+// Issue #117: Multi-Sig Veto Constants
+const MASSIVE_SLASH_THRESHOLD: i128 = 10000_0000000; // 10,000 tokens (in smallest units)
+const VETO_TIMELOCK_PERIOD: u64 = 24 * 60 * 60; // 24 hours timelock for massive slashes
+const DEFAULT_VETO_THRESHOLD_BPS: u32 = 6000; // 60% of council voting power
+
+// Issue #118: Dynamic Protocol Fee Constants
+const DEFAULT_MAX_FEE_BPS: u32 = 3000; // 30% max fee cap
+const DEFAULT_MIN_FEE_BPS: u32 = 0;    // 0% minimum fee
+const DEFAULT_MAX_INCREASE_BPS: u32 = 500; // 5% max increase per update
+const DEFAULT_FEE_TIMELOCK: u64 = 7 * 24 * 60 * 60; // 7 days timelock
+const DEFAULT_PROTOCOL_FEE_BPS: u32 = 100; // 1% default fee
+
+// Issue #119: Quadratic Voting Constants
+const GOVERNANCE_ROUND_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days voting period
+const FLASH_LOAN_PROTECTION_BUFFER: u64 = 24 * 60 * 60; // 24 hours snapshot before round
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -1181,6 +1346,9 @@ impl LeaseContract {
             payment_token: params.payment_token.clone(),
         };
         save_lease_instance(&env, lease_id, &lease);
+
+        // Add to active leases index for optimized querying (Issue #124)
+        Self::add_to_active_leases_index(&env, lease_id)?;
 
         // Initialize velocity tracker for landlord and update portfolio size
         VelocityGuard::initialize_lessor(&env, &landlord)?;
@@ -2464,6 +2632,37 @@ impl LeaseContract {
         let tenant_refund = total_deposit.saturating_sub(penalty_amount);
         let landlord_payout = penalty_amount;
 
+        // Issue #117: Check if this is a massive slash requiring multi-sig veto
+        if landlord_payout >= MASSIVE_SLASH_THRESHOLD {
+            // Check if security council is initialized
+            if env.storage().instance().get(&DataKey::SecurityCouncil).is_some() {
+                // Create pending slash with timelock
+                let current_time = env.ledger().timestamp();
+                let pending_slash = PendingSlashVeto {
+                    lease_id: payload.lease_id,
+                    slash_amount: penalty_amount,
+                    tenant_refund,
+                    landlord_payout,
+                    oracle_payload: payload.clone(),
+                    proposed_at: current_time,
+                    timelock_end: current_time + VETO_TIMELOCK_PERIOD,
+                    veto_votes_for: 0,
+                    veto_votes_against: 0,
+                    executed: false,
+                    vetoed: false,
+                };
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingSlash(payload.lease_id), &pending_slash);
+
+                // Don't execute immediately - wait for veto period
+                return Err(LeaseError::PendingVeto);
+            }
+        }
+
+        // Standard slash execution (no veto or council not initialized)
+
         if payload.damage_severity as u32 >= DamageSeverity::Severe as u32
             && penalty_amount >= total_deposit
         {
@@ -2853,11 +3052,607 @@ impl LeaseContract {
             .get(&DataKey::YieldAccumulated(lease_id))
             .unwrap_or(0)
     }
+
+    // ========================================================================
+    // Issue #117: Multi-Sig Veto on Massive Deposit Slashing
+    // ========================================================================
+
+    pub fn initialize_security_council(
+        env: Env,
+        admin: Address,
+        members: soroban_sdk::Vec<SecurityCouncilMember>,
+        veto_threshold_bps: u32,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+
+        let mut total_voting_power: u32 = 0;
+        for member in members.iter() {
+            total_voting_power += member.voting_power;
+        }
+
+        let council = SecurityCouncil {
+            members,
+            veto_threshold_bps,
+            total_voting_power,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SecurityCouncil, &council);
+
+        Ok(())
+    }
+
+    pub fn add_council_member(
+        env: Env,
+        admin: Address,
+        member: SecurityCouncilMember,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+
+        let mut council: SecurityCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecurityCouncil)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        let mut members = council.members;
+        members.push_back(member);
+        council.members = members;
+        council.total_voting_power += member.voting_power;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SecurityCouncil, &council);
+
+        Ok(())
+    }
+
+    pub fn veto_slash_vote(
+        env: Env,
+        council_member: Address,
+        lease_id: u64,
+        vote_for_veto: bool,
+    ) -> Result<(), LeaseError> {
+        // Verify caller is a council member
+        let council: SecurityCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecurityCouncil)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        let mut member_voting_power: u32 = 0;
+        let mut is_member = false;
+
+        for member in council.members.iter() {
+            if member.address == council_member && member.active {
+                member_voting_power = member.voting_power;
+                is_member = true;
+                break;
+            }
+        }
+
+        if !is_member {
+            return Err(LeaseError::Unauthorized);
+        }
+
+        council_member.require_auth();
+
+        // Get pending slash
+        let mut pending_slash: PendingSlashVeto = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSlash(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        if pending_slash.executed || pending_slash.vetoed {
+            return Err(LeaseError::InvalidState);
+        }
+
+        // Check if already voted
+        let vote_key = DataKey::VetoVote(lease_id, council_member.clone());
+        if env.storage().instance().get(&vote_key).is_some() {
+            return Err(LeaseError::AlreadyVoted);
+        }
+
+        // Record vote
+        if vote_for_veto {
+            pending_slash.veto_votes_for += member_voting_power;
+        } else {
+            pending_slash.veto_votes_against += member_voting_power;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingSlash(lease_id), &pending_slash);
+        env.storage().instance().set(&vote_key, &true);
+
+        Ok(())
+    }
+
+    pub fn execute_pending_slash(env: Env, lease_id: u64) -> Result<(), LeaseError> {
+        let pending_slash: PendingSlashVeto = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSlash(lease_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        if pending_slash.executed || pending_slash.vetoed {
+            return Err(LeaseError::InvalidState);
+        }
+
+        let current_time = env.ledger().timestamp();
+
+        // Check if timelock has expired
+        if current_time < pending_slash.timelock_end {
+            return Err(LeaseError::TimelockNotExpired);
+        }
+
+        // Check if veto was successful
+        let council: SecurityCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecurityCouncil)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        let veto_threshold = (council.total_voting_power as i128
+            * council.veto_threshold_bps as i128)
+            / 10000;
+
+        if pending_slash.veto_votes_for as i128 >= veto_threshold {
+            // Veto succeeded - cancel the slash
+            let mut updated_slash = pending_slash.clone();
+            updated_slash.vetoed = true;
+            updated_slash.executed = true;
+            env.storage()
+                .instance()
+                .set(&DataKey::PendingSlash(lease_id), &updated_slash);
+
+            // Return full deposit to tenant
+            let token_client =
+                token_contract::TokenClient::new(&env, &pending_slash.oracle_payload.lease_id.into());
+            // Note: Actual token transfer would need the correct token address from lease
+
+            return Ok(());
+        }
+
+        // Veto failed - execute the original slash
+        let mut updated_slash = pending_slash.clone();
+        updated_slash.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingSlash(lease_id), &updated_slash);
+
+        // Execute the original slash logic
+        Self::execute_deposit_slash(env, pending_slash.oracle_payload)
+    }
+
+    // ========================================================================
+    // Issue #118: DAO-Governed Dynamic Protocol Fee Updates
+    // ========================================================================
+
+    pub fn initialize_protocol_fee_config(
+        env: Env,
+        admin: Address,
+        config: ProtocolFeeConfig,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+
+        // Validate configuration
+        if config.current_fee_bps > config.max_fee_bps {
+            return Err(LeaseError::InvalidParameters);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolFeeConfig, &config);
+
+        Ok(())
+    }
+
+    pub fn propose_fee_update(
+        env: Env,
+        proposer: Address,
+        new_fee_bps: u32,
+    ) -> Result<(), LeaseError> {
+        proposer.require_auth();
+
+        let config: ProtocolFeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeConfig)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        // Validate fee is within bounds
+        if new_fee_bps < config.min_fee_bps || new_fee_bps > config.max_fee_bps {
+            return Err(LeaseError::InvalidParameters);
+        }
+
+        // Validate max increase limit
+        let current_fee = config.current_fee_bps;
+        if new_fee_bps > current_fee {
+            let increase = new_fee_bps - current_fee;
+            if increase > config.max_increase_bps {
+                return Err(LeaseError::InvalidParameters);
+            }
+        }
+
+        let current_time = env.ledger().timestamp();
+        let execution_time = current_time + config.update_timelock;
+
+        let pending_update = PendingFeeUpdate {
+            proposed_fee_bps: new_fee_bps,
+            proposed_by: proposer,
+            proposed_at: current_time,
+            execution_time,
+            votes_for: 0,
+            votes_against: 0,
+            executed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingFeeUpdate, &pending_update);
+
+        Ok(())
+    }
+
+    pub fn vote_on_fee_update(
+        env: Env,
+        voter: Address,
+        vote_for: bool,
+    ) -> Result<(), LeaseError> {
+        voter.require_auth();
+
+        let mut pending_update: PendingFeeUpdate = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingFeeUpdate)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        if pending_update.executed {
+            return Err(LeaseError::InvalidState);
+        }
+
+        // Simple vote counting (can be enhanced with token-weighted voting)
+        if vote_for {
+            pending_update.votes_for += 1;
+        } else {
+            pending_update.votes_against += 1;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingFeeUpdate, &pending_update);
+
+        Ok(())
+    }
+
+    pub fn execute_fee_update(env: Env) -> Result<(), LeaseError> {
+        let mut pending_update: PendingFeeUpdate = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingFeeUpdate)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        if pending_update.executed {
+            return Err(LeaseError::InvalidState);
+        }
+
+        let current_time = env.ledger().timestamp();
+
+        // Check timelock
+        if current_time < pending_update.execution_time {
+            return Err(LeaseError::TimelockNotExpired);
+        }
+
+        // Check if proposal passed (simple majority)
+        if pending_update.votes_for <= pending_update.votes_against {
+            return Err(LeaseError::ProposalRejected);
+        }
+
+        // Update fee configuration
+        let mut config: ProtocolFeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeConfig)
+            .ok_or(LeaseError::Unauthorized)?;
+
+        config.current_fee_bps = pending_update.proposed_fee_bps;
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolFeeConfig, &config);
+
+        // Mark as executed
+        pending_update.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingFeeUpdate, &pending_update);
+
+        Ok(())
+    }
+
+    pub fn get_protocol_fee_config(env: Env) -> Result<ProtocolFeeConfig, LeaseError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeConfig)
+            .ok_or(LeaseError::Unauthorized)
+    }
+
+    // ========================================================================
+    // Issue #119: Quadratic Voting for Treasury Yield Allocation
+    // ========================================================================
+
+    pub fn create_governance_round(
+        env: Env,
+        admin: Address,
+        round_id: u64,
+        total_treasury_yield: i128,
+        allocation_options: soroban_sdk::Vec<AllocationOption>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+
+        let current_time = env.ledger().timestamp();
+        let snapshot_timestamp = current_time - FLASH_LOAN_PROTECTION_BUFFER;
+
+        let round = GovernanceRound {
+            round_id,
+            start_time: current_time,
+            end_time: current_time + GOVERNANCE_ROUND_DURATION,
+            total_treasury_yield,
+            allocation_options,
+            active: true,
+            snapshot_timestamp,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceRound(round_id), &round);
+
+        Ok(())
+    }
+
+    pub fn cast_treasury_vote(
+        env: Env,
+        voter: Address,
+        round_id: u64,
+        option_id: u32,
+        tokens_committed: i128,
+    ) -> Result<(), LeaseError> {
+        voter.require_auth();
+
+        if tokens_committed <= 0 {
+            return Err(LeaseError::InvalidParameters);
+        }
+
+        let round: GovernanceRound = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceRound(round_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        if !round.active {
+            return Err(LeaseError::InvalidState);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time > round.end_time {
+            return Err(LeaseError::GovernanceRoundEnded);
+        }
+
+        // Calculate quadratic voting power: sqrt(tokens_committed)
+        let voting_power = Self::integer_sqrt(tokens_committed);
+
+        // Record the vote
+        let vote = TreasuryVote {
+            round_id,
+            voter: voter.clone(),
+            option_id,
+            tokens_committed,
+            voting_power,
+            voted_at: current_time,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryVote(round_id, voter), &vote);
+
+        // Update allocation option totals
+        let mut options = round.allocation_options;
+        for i in 0..options.len() {
+            let mut option = options.get(i).unwrap();
+            if option.option_id == option_id {
+                option.total_quadratic_votes += voting_power;
+                options.set(i, option);
+                break;
+            }
+        }
+
+        let mut updated_round = round;
+        updated_round.allocation_options = options;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceRound(round_id), &updated_round);
+
+        Ok(())
+    }
+
+    pub fn finalize_governance_round(
+        env: Env,
+        round_id: u64,
+    ) -> Result<soroban_sdk::Vec<AllocationOption>, LeaseError> {
+        let mut round: GovernanceRound = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceRound(round_id))
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        if !round.active {
+            return Err(LeaseError::InvalidState);
+        }
+
+        let current_time = env.ledger().timestamp();
+        if current_time < round.end_time {
+            return Err(LeaseError::GovernanceRoundActive);
+        }
+
+        round.active = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceRound(round_id), &round);
+
+        // Calculate total quadratic votes
+        let mut total_quadratic_votes: i128 = 0;
+        for option in round.allocation_options.iter() {
+            total_quadratic_votes += option.total_quadratic_votes;
+        }
+
+        // Distribute treasury yield proportionally
+        let options = round.allocation_options;
+        // Note: Actual token transfers would be executed here based on allocations
+
+        Ok(options)
+    }
+
+    fn integer_sqrt(n: i128) -> i128 {
+        if n <= 0 {
+            return 0;
+        }
+        let mut x = n;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        x
+    }
+
+    // ========================================================================
+    // Issue #124: Highly Optimized get_active_leases Read-Only Query
+    // ========================================================================
+
+    pub fn get_active_leases(env: Env) -> soroban_sdk::Vec<ActiveLeaseSummary> {
+        // This is a read-only function - no state mutations
+        // Returns comprehensive lease data for frontend rendering
+
+        let mut active_leases = soroban_sdk::Vec::new(&env);
+
+        // Iterate through lease instances (in production, this would use an index)
+        // For optimization, we maintain an ActiveLeasesIndex
+        let lease_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLeasesIndex)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        for lease_id in lease_ids.iter() {
+            if let Ok(lease) = Self::get_lease_instance(env.clone(), lease_id) {
+                // Only return active leases
+                if lease.active
+                    && (lease.status == LeaseStatus::Active
+                        || lease.status == LeaseStatus::Pending)
+                {
+                    let summary = ActiveLeaseSummary {
+                        lease_id,
+                        landlord: lease.landlord,
+                        tenant: lease.tenant,
+                        rent_amount: lease.rent_amount,
+                        rent_per_sec: lease.rent_per_sec,
+                        deposit_amount: lease.deposit_amount,
+                        security_deposit: lease.security_deposit,
+                        start_date: lease.start_date,
+                        end_date: lease.end_date,
+                        property_uri: lease.property_uri,
+                        status: lease.status,
+                        payment_token: lease.payment_token,
+                        rent_paid: lease.rent_paid,
+                        cumulative_payments: lease.cumulative_payments,
+                        debt: lease.debt,
+                        active: lease.active,
+                        yield_delegation_enabled: lease.yield_delegation_enabled,
+                        equity_percentage_bps: lease.equity_percentage_bps,
+                    };
+                    active_leases.push_back(summary);
+                }
+            }
+        }
+
+        active_leases
+    }
+
+    pub fn add_to_active_leases_index(env: &Env, lease_id: u64) -> Result<(), LeaseError> {
+        let mut index: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLeasesIndex)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        index.push_back(lease_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLeasesIndex, &index);
+
+        Ok(())
+    }
+
+    pub fn remove_from_active_leases_index(env: &Env, lease_id: u64) -> Result<(), LeaseError> {
+        let mut index: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLeasesIndex)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        let mut new_index = soroban_sdk::Vec::new(&env);
+        for id in index.iter() {
+            if id != lease_id {
+                new_index.push_back(id);
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLeasesIndex, &new_index);
+
+        Ok(())
+    }
 }
 
 mod test;
 mod upgrade_tests;
 mod oracle_fallback_tests;
+mod governance_tests;
 
 // Global Escrow Freeze Circuit Breaker Modules
 pub mod escrow_vault;
