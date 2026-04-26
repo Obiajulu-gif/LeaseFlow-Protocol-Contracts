@@ -1,5 +1,6 @@
 #![no_std]
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, env, symbol, Address, Bytes, Symbol, Vec, Map, U256, i64, u64};
+use leaseflow_math::{calculate_prorated_rent, calculate_termination_refund};
 
 // Contract state key
 const DATA_KEY: Symbol = symbol!("DATA");
@@ -87,6 +88,15 @@ pub struct DepositSlashedForArrearsEvent {
     pub residual_debt: i64,
 }
 
+#[contracttype]
+pub struct ProratedRentCalculatedEvent {
+    pub lease_id: u64,
+    pub monthly_rent: i64,
+    pub elapsed_seconds: u64,
+    pub prorated_amount: i64,
+    pub calculation_type: Symbol, // "initialization" or "termination"
+}
+
 // Protocol Credit Record for tracking residual debt
 #[derive(Clone, Debug, contracttype)]
 pub struct ProtocolCreditRecord {
@@ -124,6 +134,8 @@ pub struct Lease {
     pub last_rent_payment_timestamp: u64,
     pub property_uri: Bytes,
     pub arrears_processed: bool, // Track if arrears deduction has been executed
+    pub prorated_initial_rent: i64, // Track prorated rent for initial partial period
+    pub total_paid_rent: i64, // Track total rent paid for refund calculations
 }
 
 // Contract data structure
@@ -182,6 +194,17 @@ impl LeaseFlowContract {
         let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
         let lease_id = data.next_lease_id;
 
+        // Calculate prorated rent for initial period
+        let current_timestamp = env.ledger().timestamp();
+        let prorated_initial_rent = if current_timestamp > start_date {
+            // Lease starts mid-cycle - calculate prorated rent for remaining period
+            calculate_prorated_rent(rent_amount, current_timestamp, end_date)
+                .map(|(amount, _)| amount)
+                .unwrap_or(rent_amount) // Fallback to full rent if calculation fails
+        } else {
+            rent_amount // Full rent for future start dates
+        };
+
         let lease = Lease {
             lease_id,
             lessor: lessor.clone(),
@@ -199,6 +222,8 @@ impl LeaseFlowContract {
             last_rent_payment_timestamp: 0,
             property_uri,
             arrears_processed: false,
+            prorated_initial_rent,
+            total_paid_rent: 0,
         };
 
         data.leases.set(lease_id, lease);
@@ -249,6 +274,21 @@ impl LeaseFlowContract {
         
         lease.state = LeaseState::Active;
         lease.last_rent_payment_timestamp = env.ledger().timestamp();
+        
+        // Emit ProratedRentCalculated event if prorated rent was applied
+        if lease.prorated_initial_rent != lease.rent_amount {
+            let elapsed_seconds = lease.end_date.saturating_sub(env.ledger().timestamp());
+            env.events().publish(
+                symbol!("ProratedRentCalculated"),
+                ProratedRentCalculatedEvent {
+                    lease_id,
+                    monthly_rent: lease.rent_amount,
+                    elapsed_seconds,
+                    prorated_amount: lease.prorated_initial_rent,
+                    calculation_type: symbol!("initialization"),
+                },
+            );
+        }
 
         data.leases.set(lease_id, lease);
         env.storage().instance().set(&DATA_KEY, &data);
@@ -280,6 +320,7 @@ impl LeaseFlowContract {
                 lease.last_rent_payment_timestamp = env.ledger().timestamp();
                 lease.outstanding_balance = 0;
                 lease.accumulated_late_fees = 0;
+                lease.total_paid_rent += amount;
             }
             LeaseState::GracePeriod => {
                 // Recovery payment during grace period
@@ -294,6 +335,7 @@ impl LeaseFlowContract {
                 lease.outstanding_balance = 0;
                 lease.accumulated_late_fees = 0;
                 lease.dunning_start_timestamp = None;
+                lease.total_paid_rent += amount;
 
                 // Emit recovery event
                 env.events().publish(
@@ -563,5 +605,80 @@ impl LeaseFlowContract {
         }
 
         Self::check_grace_period_expiry(env, lease_id)
+    }
+
+    // Terminate lease amicably with prorated refund
+    pub fn terminate_lease(env: env::Env, lease_id: u64, caller: Address) -> Result<i64, Error> {
+        let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
+        let mut lease = data.leases.get(lease_id).ok_or(Error::LeaseNotFound)?;
+
+        // Only lessor or lessee can terminate
+        if caller != lease.lessor && caller != lease.lessee {
+            return Err(Error::Unauthorized);
+        }
+
+        // Can only terminate active leases
+        if lease.state != LeaseState::Active {
+            return Err(Error::LeaseNotActive);
+        }
+
+        let current_timestamp = env.ledger().timestamp();
+        
+        // Calculate prorated refund for unused period
+        let refund_amount = calculate_termination_refund(
+            lease.rent_amount,
+            lease.start_date,
+            lease.end_date,
+            current_timestamp,
+            lease.total_paid_rent,
+        ).unwrap_or(0);
+
+        // Apply security measure: ensure minimum holding period to prevent exploitation
+        let minimum_holding_period = 86400; // 24 hours minimum
+        let lease_duration = current_timestamp.saturating_sub(lease.last_rent_payment_timestamp);
+        
+        if lease_duration < minimum_holding_period && refund_amount > 0 {
+            // Apply penalty for rapid termination to prevent exploitation
+            let penalty_amount = refund_amount / 10; // 10% penalty
+            let adjusted_refund = refund_amount.saturating_sub(penalty_amount);
+            
+            // Emit ProratedRentCalculated event with penalty
+            env.events().publish(
+                symbol!("ProratedRentCalculated"),
+                ProratedRentCalculatedEvent {
+                    lease_id,
+                    monthly_rent: lease.rent_amount,
+                    elapsed_seconds: lease.end_date.saturating_sub(current_timestamp),
+                    prorated_amount: adjusted_refund,
+                    calculation_type: symbol!("termination"),
+                },
+            );
+
+            // Update lease state
+            lease.state = LeaseState::Closed;
+            data.leases.set(lease_id, lease);
+            env.storage().instance().set(&DATA_KEY, &data);
+
+            return Ok(adjusted_refund);
+        }
+
+        // Emit ProratedRentCalculated event
+        env.events().publish(
+            symbol!("ProratedRentCalculated"),
+            ProratedRentCalculatedEvent {
+                lease_id,
+                monthly_rent: lease.rent_amount,
+                elapsed_seconds: lease.end_date.saturating_sub(current_timestamp),
+                prorated_amount: refund_amount,
+                calculation_type: symbol!("termination"),
+            },
+        );
+
+        // Update lease state
+        lease.state = LeaseState::Closed;
+        data.leases.set(lease_id, lease);
+        env.storage().instance().set(&DATA_KEY, &data);
+
+        Ok(refund_amount)
     }
 }

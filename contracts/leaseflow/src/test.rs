@@ -336,6 +336,230 @@ mod test {
         assert!(credit_record.total_debt_amount > 0);
     }
 
+    #[test]
+    fn test_prorated_rent_initialization() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        client.initialize();
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let rent_amount = 3100; // Amount divisible by 31 days
+        let deposit_amount = 2000;
+        
+        // Create lease that starts in the past (mid-cycle scenario)
+        let past_start = env.ledger().timestamp() - 5 * 86400; // Started 5 days ago
+        let end_date = past_start + 31 * 86400; // 31-day lease
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &rent_amount,
+            &deposit_amount,
+            &past_start,
+            &end_date,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+        );
+
+        let lease = client.get_lease(&lease_id);
+        
+        // Should have prorated initial rent (26 days remaining out of 31)
+        // 3100 * (26/31) = 2600
+        assert_eq!(lease.prorated_initial_rent, 2600);
+        assert_eq!(lease.total_paid_rent, 0);
+    }
+
+    #[test]
+    fn test_prorated_rent_future_start() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        client.initialize();
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let rent_amount = 1000;
+        let deposit_amount = 2000;
+        
+        // Create lease that starts in the future
+        let future_start = env.ledger().timestamp() + 10 * 86400; // Starts in 10 days
+        let end_date = future_start + 30 * 86400;
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &rent_amount,
+            &deposit_amount,
+            &future_start,
+            &end_date,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+        );
+
+        let lease = client.get_lease(&lease_id);
+        
+        // Should have full rent (no proration for future start)
+        assert_eq!(lease.prorated_initial_rent, rent_amount);
+    }
+
+    #[test]
+    fn test_lease_termination_with_refund() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        client.initialize();
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let rent_amount = 3100; // Divisible by 31 days
+        let deposit_amount = 2000;
+        
+        let start_date = env.ledger().timestamp();
+        let end_date = start_date + 31 * 86400;
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &rent_amount,
+            &deposit_amount,
+            &start_date,
+            &end_date,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Pay rent for tracking
+        client.process_rent_payment(&lease_id, &rent_amount);
+        
+        // Advance time by 10 days
+        env.ledger().set_timestamp(start_date + 10 * 86400);
+        
+        // Terminate lease (should refund for 21 remaining days)
+        let refund = client.terminate_lease(&lease_id, &lessor);
+        
+        // Expected refund: 3100 * (21/31) = 2100, minus 1 stroop = 2099
+        assert_eq!(refund, 2099);
+        
+        let lease = client.get_lease(&lease_id);
+        assert_eq!(lease.state, LeaseState::Closed);
+    }
+
+    #[test]
+    fn test_lease_termination_security_penalty() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        client.initialize();
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let rent_amount = 1000;
+        let deposit_amount = 2000;
+        
+        let start_date = env.ledger().timestamp();
+        let end_date = start_date + 30 * 86400;
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &rent_amount,
+            &deposit_amount,
+            &start_date,
+            &end_date,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        client.process_rent_payment(&lease_id, &rent_amount);
+        
+        // Terminate immediately (within 24 hours) - should apply penalty
+        let refund = client.terminate_lease(&lease_id, &lessor);
+        
+        // Should apply 10% penalty for rapid termination
+        // Full refund would be ~1000, penalty would be ~100, so refund ~900
+        assert!(refund < 1000);
+        assert!(refund > 800); // Should be reasonable
+    }
+
+    #[test]
+    fn test_lease_termination_unauthorized() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        client.initialize();
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000,
+            &2000,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Try to terminate with unauthorized address
+        let result = client.try_terminate_lease(&lease_id, &unauthorized);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_prorated_rent_tracking() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        client.initialize();
+
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let rent_amount = 1000;
+        let deposit_amount = 2000;
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &rent_amount,
+            &deposit_amount,
+            &1000,
+            &5000,
+            &432000,
+            &500,
+            &Bytes::from_slice(&env, b"property_uri"),
+        );
+
+        client.activate_lease(&lease_id, &lessee);
+        
+        // Make multiple payments
+        client.process_rent_payment(&lease_id, &rent_amount);
+        client.process_rent_payment(&lease_id, &rent_amount);
+        
+        let lease = client.get_lease(&lease_id);
+        assert_eq!(lease.total_paid_rent, 2000); // Should track total payments
+    }
+
     struct LeaseFlowContractClient<'a> {
         env: &'a Env,
         contract_id: &'a soroban_sdk::Address,
@@ -443,6 +667,24 @@ mod test {
                 soroban_sdk::xdr::ScVal::Void,
             );
             result.try_into().unwrap()
+        }
+
+        fn terminate_lease(&self, lease_id: &u64, caller: &Address) -> i64 {
+            let result = self.env.invoke_contract(
+                self.contract_id,
+                &soroban_sdk::symbol!("terminate_lease"),
+                soroban_sdk::xdr::ScVal::try_from((lease_id, caller)).unwrap(),
+            );
+            result.try_into().unwrap()
+        }
+
+        fn try_terminate_lease(&self, lease_id: &u64, caller: &Address) -> Result<i64, Error> {
+            let result = self.env.invoke_contract(
+                self.contract_id,
+                &soroban_sdk::symbol!("terminate_lease"),
+                soroban_sdk::xdr::ScVal::try_from((lease_id, caller)).unwrap(),
+            );
+            result.try_into()
         }
     }
 }
