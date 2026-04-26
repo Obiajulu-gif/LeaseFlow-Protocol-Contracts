@@ -29,6 +29,9 @@ pub enum Error {
     LeaseNotActive = 9,
     EvictionAlreadyPending = 10,
     LateFeeCalculationError = 11,
+    ArrearsAlreadyProcessed = 12,
+    EscrowVaultUnderflow = 13,
+    CreditRecordError = 14,
 }
 
 // Events
@@ -75,6 +78,33 @@ pub struct EvictionPendingEvent {
     pub total_outstanding: i64,
 }
 
+#[contracttype]
+pub struct DepositSlashedForArrearsEvent {
+    pub lease_id: u64,
+    pub unpaid_duration: u64,
+    pub deducted_amount: i64,
+    pub remaining_escrow_balance: i64,
+    pub residual_debt: i64,
+}
+
+// Protocol Credit Record for tracking residual debt
+#[derive(Clone, Debug, contracttype)]
+pub struct ProtocolCreditRecord {
+    pub lessee: Address,
+    pub total_debt_amount: i64,
+    pub default_count: u32,
+    pub last_default_timestamp: u64,
+    pub associated_lease_ids: Vec<u64>,
+}
+
+// Escrow Vault structure for managing security deposits
+#[derive(Clone, Debug, contracttype)]
+pub struct EscrowVault {
+    pub total_locked: i64,
+    pub available_balance: i64,
+    pub lessor_treasury: i64,
+}
+
 // Lease structure
 #[derive(Clone, Debug, contracttype)]
 pub struct Lease {
@@ -93,6 +123,7 @@ pub struct Lease {
     pub accumulated_late_fees: i64,
     pub last_rent_payment_timestamp: u64,
     pub property_uri: Bytes,
+    pub arrears_processed: bool, // Track if arrears deduction has been executed
 }
 
 // Contract data structure
@@ -100,6 +131,8 @@ pub struct Lease {
 pub struct ContractData {
     pub leases: Map<u64, Lease>,
     pub next_lease_id: u64,
+    pub escrow_vault: EscrowVault,
+    pub credit_records: Map<Address, ProtocolCreditRecord>,
 }
 
 // Contract implementation
@@ -110,9 +143,17 @@ pub struct LeaseFlowContract;
 impl LeaseFlowContract {
     // Initialize contract
     pub fn initialize(env: env::Env) {
+        let escrow_vault = EscrowVault {
+            total_locked: 0,
+            available_balance: 0,
+            lessor_treasury: 0,
+        };
+        
         let data = ContractData {
             leases: Map::new(&env),
             next_lease_id: 1,
+            escrow_vault,
+            credit_records: Map::new(&env),
         };
         env.storage().instance().set(&DATA_KEY, &data);
     }
@@ -157,6 +198,7 @@ impl LeaseFlowContract {
             accumulated_late_fees: 0,
             last_rent_payment_timestamp: 0,
             property_uri,
+            arrears_processed: false,
         };
 
         data.leases.set(lease_id, lease);
@@ -199,6 +241,11 @@ impl LeaseFlowContract {
 
         // In a real implementation, we would transfer tokens here
         // For now, we'll assume the deposit is available and update state
+        
+        // Update escrow vault with the security deposit
+        let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
+        data.escrow_vault.total_locked += deposit_amount;
+        data.escrow_vault.available_balance += deposit_amount;
         
         lease.state = LeaseState::Active;
         lease.last_rent_payment_timestamp = env.ledger().timestamp();
@@ -339,6 +386,9 @@ impl LeaseFlowContract {
 
             data.leases.set(lease_id, lease);
             env.storage().instance().set(&DATA_KEY, &data);
+            
+            // Automatically execute arrears deduction
+            Self::execute_arrears_deduction(env, lease_id)?;
         }
 
         Ok(())
@@ -377,6 +427,129 @@ impl LeaseFlowContract {
         }
 
         user_leases
+    }
+
+    // Execute automated security deposit deduction for rent arrears
+    pub fn execute_arrears_deduction(env: env::Env, lease_id: u64) -> Result<(), Error> {
+        let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
+        let mut lease = data.leases.get(lease_id).ok_or(Error::LeaseNotFound)?;
+
+        // Only execute from EvictionPending state and ensure not already processed
+        if lease.state != LeaseState::EvictionPending {
+            return Err(Error::InvalidStateTransition);
+        }
+        
+        if lease.arrears_processed {
+            return Err(Error::ArrearsAlreadyProcessed);
+        }
+
+        let current_timestamp = env.ledger().timestamp();
+        
+        // Calculate unpaid duration (from dunning start to eviction)
+        let dunning_start = lease.dunning_start_timestamp.ok_or(Error::InvalidStateTransition)?;
+        let unpaid_duration = current_timestamp.saturating_sub(dunning_start);
+
+        // Calculate total arrears (unpaid rent + late fees)
+        let total_arrears = lease.outstanding_balance + lease.accumulated_late_fees;
+
+        // Calculate deduction amount with safety rounding in favor of protocol
+        let deduction_amount = Self::calculate_deduction_amount(total_arrears, lease.deposit_amount)?;
+
+        // Update escrow vault - transfer to lessor's operational treasury
+        if data.escrow_vault.available_balance < deduction_amount {
+            return Err(Error::EscrowVaultUnderflow);
+        }
+        
+        data.escrow_vault.available_balance -= deduction_amount;
+        data.escrow_vault.lessor_treasury += deduction_amount;
+
+        // Calculate residual debt (if any)
+        let residual_debt = total_arrears.saturating_sub(deduction_amount);
+
+        // Update lease to mark arrears as processed
+        lease.arrears_processed = true;
+
+        // Handle residual debt tracking
+        if residual_debt > 0 {
+            Self::update_credit_record(&env, &mut data, lease.lessee.clone(), residual_debt, lease_id)?;
+        }
+
+        // Emit detailed event
+        env.events().publish(
+            symbol!("DepositSlashedForArrears"),
+            DepositSlashedForArrearsEvent {
+                lease_id,
+                unpaid_duration,
+                deducted_amount: deduction_amount,
+                remaining_escrow_balance: data.escrow_vault.available_balance,
+                residual_debt,
+            },
+        );
+
+        // Save updated data
+        data.leases.set(lease_id, lease);
+        env.storage().instance().set(&DATA_KEY, &data);
+
+        Ok(())
+    }
+
+    // Calculate deduction amount with safety rounding in favor of protocol
+    fn calculate_deduction_amount(total_arrears: i64, deposit_amount: i64) -> Result<i64, Error> {
+        if total_arrears <= 0 || deposit_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // If arrears exceed deposit, drain entire deposit
+        if total_arrears >= deposit_amount {
+            return Ok(deposit_amount);
+        }
+
+        // Otherwise, deduct exact arrears amount
+        Ok(total_arrears)
+    }
+
+    // Update or create credit record for residual debt
+    fn update_credit_record(
+        env: &env::Env,
+        data: &mut ContractData, 
+        lessee: Address, 
+        residual_debt: i64, 
+        lease_id: u64
+    ) -> Result<(), Error> {
+        let current_timestamp = env.ledger().timestamp();
+        
+        let mut record = data.credit_records.get(&lessee).unwrap_or_else(|| ProtocolCreditRecord {
+            lessee: lessee.clone(),
+            total_debt_amount: 0,
+            default_count: 0,
+            last_default_timestamp: 0,
+            associated_lease_ids: Vec::new(env),
+        });
+
+        // Update record with new debt
+        record.total_debt_amount += residual_debt;
+        record.default_count += 1;
+        record.last_default_timestamp = current_timestamp;
+        
+        // Add lease ID if not already present
+        if !record.associated_lease_ids.contains(&lease_id) {
+            record.associated_lease_ids.push_back(lease_id);
+        }
+
+        data.credit_records.set(lessee, record);
+        Ok(())
+    }
+
+    // Get credit record for a specific lessee
+    pub fn get_credit_record(env: env::Env, lessee: Address) -> Result<ProtocolCreditRecord, Error> {
+        let data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
+        data.credit_records.get(&lessee).ok_or(Error::CreditRecordError)
+    }
+
+    // Get escrow vault information
+    pub fn get_escrow_vault(env: env::Env) -> Result<EscrowVault, Error> {
+        let data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
+        Ok(data.escrow_vault)
     }
 
     // Emergency function to manually trigger grace period check
