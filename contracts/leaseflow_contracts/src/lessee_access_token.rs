@@ -748,7 +748,6 @@ mod tests {
             has_pet: false,
             pet_deposit_amount: 0,
             pet_rent_amount: 0,
-            last_tenant_interaction: env.ledger().timestamp(),
         };
         
         // Store lease

@@ -30,3 +30,9 @@ path = "fuzz_targets/fuzz_abandoned_deposit.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_timestamp_injection"
+path = "fuzz_targets/fuzz_timestamp_injection.rs"
+test = false
+doc = false
+
